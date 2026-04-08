@@ -1,5 +1,5 @@
 /**
- * Complexity Metrics Client for pi-lens (cache test)
+ * Complexity Metrics Client for pi-lens
  *
  * Calculates AST-based code complexity metrics for TypeScript/JavaScript files.
  * Uses the TypeScript compiler API for parsing.
@@ -331,12 +331,10 @@ export class ComplexityClient {
 			);
 		}
 
-		// Code entropy (in bits, >5.5 = risky AI-induced complexity)
-		// Threshold increased from 3.5 to 5.5 to reduce false positives in tooling codebases
-		// where diverse method/variable names are naturally expected
-		if (metrics.codeEntropy > 5.5) {
+		// Code entropy (in bits, >3.5 = risky AI-induced complexity)
+		if (metrics.codeEntropy > 3.5) {
 			parts.push(
-				`  Entropy: ${metrics.codeEntropy.toFixed(1)} bits (>5.5 — risky AI-induced complexity)`,
+				`  Entropy: ${metrics.codeEntropy.toFixed(1)} bits (>3.5 — risky AI-induced complexity)`,
 			);
 		}
 
@@ -453,45 +451,39 @@ export class ComplexityClient {
 	checkThresholds(metrics: FileComplexity): string[] {
 		const warnings: string[] = [];
 
-		// TUNED: Only flag extreme cases to reduce noise
-		// MI < 30 is "critically poor" (was < 60, too aggressive)
-		if (metrics.maintainabilityIndex < 30) {
+		if (metrics.maintainabilityIndex < 60) {
 			warnings.push(
 				`Maintainability dropped to ${metrics.maintainabilityIndex} — extract logic into helper functions`,
 			);
 		}
 
-		// Cyclomatic > 20 is very high (was > 10)
-		if (metrics.cyclomaticComplexity > 20) {
+		if (metrics.cyclomaticComplexity > 10) {
 			warnings.push(
 				`High complexity (${metrics.cyclomaticComplexity}) — use early returns or switch expressions`,
 			);
 		}
 
-		// Cognitive > 50 is high (was > 15, flagged almost everything)
-		if (metrics.cognitiveComplexity > 50) {
+		if (metrics.cognitiveComplexity > 15) {
 			warnings.push(
 				`Cognitive complexity (${metrics.cognitiveComplexity}) — simplify logic flow`,
 			);
 		}
 
-		// Nesting > 6 is deep (was > 4, normal for complex code)
-		if (metrics.maxNestingDepth > 6) {
+		if (metrics.maxNestingDepth > 4) {
 			warnings.push(
 				`Deep nesting (${metrics.maxNestingDepth} levels) — extract nested logic into separate functions`,
 			);
 		}
 
-		// Entropy > 5.5 is high (was > 3.5 → 5.0, still too sensitive for tooling codebases)
-		if (metrics.codeEntropy > 5.5) {
+		if (metrics.codeEntropy > 3.5) {
 			warnings.push(
 				`High entropy (${metrics.codeEntropy.toFixed(1)} bits) — follow project conventions`,
 			);
 		}
 
-		// Comments ratio (>60% = excessive, was > 40%)
+		// Comments ratio (>40% = excessive comments, AI slop signal)
 		const totalLines = metrics.linesOfCode + metrics.commentLines;
-		if (totalLines > 10 && metrics.commentLines / totalLines > 0.6) {
+		if (totalLines > 10 && metrics.commentLines / totalLines > 0.4) {
 			warnings.push(
 				`Excessive comments (${Math.round((metrics.commentLines / totalLines) * 100)}%) — remove obvious comments`,
 			);
@@ -809,8 +801,7 @@ export class ComplexityClient {
 	/**
 	 * Calculate Shannon entropy of code tokens (in bits)
 	 * Uses log2 for entropy measured in bits
-	 * Threshold: >5.5 bits indicates risky AI-induced complexity
-	 * (Increased from 3.5 to reduce false positives in tooling codebases)
+	 * Threshold: >3.5 bits indicates risky AI-induced complexity
 	 */
 	private calculateCodeEntropy(sourceText: string): number {
 		// Tokenize by splitting on whitespace and common delimiters

@@ -3,7 +3,6 @@
  */
 
 import * as fs from "node:fs";
-import { safeSpawn } from "../../safe-spawn.js";
 import type { Diagnostic } from "../types.js";
 
 /**
@@ -22,8 +21,11 @@ export function readFileContent(filePath: string): string | undefined {
  */
 export function isCommandAvailable(command: string): boolean {
 	try {
-		const result = safeSpawn(command, ["--version"], {
+		const { spawnSync } = require("node:child_process");
+		const result = spawnSync(command, ["--version"], {
+			encoding: "utf-8",
 			timeout: 5000,
+			shell: true,
 		});
 		return result.status === 0;
 	} catch {

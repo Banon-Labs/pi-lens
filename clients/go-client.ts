@@ -10,7 +10,6 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawn } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -72,8 +71,10 @@ export class GoClient {
 					}
 				} else {
 					// Relative (PATH) - try running it
-					const result = safeSpawn(p, ["version"], {
+					const result = spawnSync(p, ["version"], {
+						encoding: "utf-8",
 						timeout: 3000,
+						shell: true,
 					});
 					if (!result.error && result.status === 0) {
 						this.goPath = p;
@@ -106,8 +107,10 @@ export class GoClient {
 	isGoplsAvailable(): boolean {
 		if (this.goplsAvailable !== null) return this.goplsAvailable;
 
-		const result = safeSpawn("gopls", ["version"], {
+		const result = spawnSync("gopls", ["version"], {
+			encoding: "utf-8",
 			timeout: 5000,
+			shell: true,
 		});
 
 		this.goplsAvailable = !result.error && result.status === 0;
@@ -139,9 +142,12 @@ export class GoClient {
 
 		try {
 			// Run go vet on the specific file
-			const result = safeSpawn(goExe, ["vet", fileName], {
+			const goCmd = goExe.includes(" ") ? `"${goExe}"` : goExe;
+			const result = spawnSync(goCmd, ["vet", fileName], {
+				encoding: "utf-8",
 				timeout: 15000,
 				cwd: dir,
+				shell: true,
 			});
 
 			const output = (result.stderr || "") + (result.stdout || "");
@@ -159,9 +165,11 @@ export class GoClient {
 		if (!this.isGoAvailable()) return [];
 
 		try {
-			const result = safeSpawn("go", ["build", "./..."], {
+			const result = spawnSync("go", ["build", "./..."], {
+				encoding: "utf-8",
 				timeout: 30000,
 				cwd,
+				shell: true,
 			});
 
 			const output = (result.stderr || "") + (result.stdout || "");

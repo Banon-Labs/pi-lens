@@ -5,27 +5,10 @@
  * Handles: spawn, spawnSync, temp dir management, JSON parsing.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	getSgCommand,
-	isSgAvailable,
-} from "./dispatch/runners/utils/runner-helpers.js";
-import { safeSpawn } from "./safe-spawn.js";
-
-/**
- * Escape an argument for Windows cmd.exe shell execution.
- * Handles spaces, quotes, and special characters.
- */
-function escapeWindowsArg(arg: string): string {
-	// If no special characters, return as-is
-	if (!/[\s"]/.test(arg)) return arg;
-
-	// Escape quotes by doubling them
-	return `"${arg.replace(/"/g, '""')}"`;
-}
 
 export interface SgMatch {
 	file: string;
@@ -44,8 +27,6 @@ export interface SgResult {
 
 export class SgRunner {
 	private log: (msg: string) => void;
-	private sgPath: string | null = null;
-	private available: boolean | null = null;
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -54,55 +35,15 @@ export class SgRunner {
 	}
 
 	/**
-	 * Check if ast-grep CLI is available, auto-install if not
-	 */
-	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.available !== null) return this.available;
-
-		// Check if available in PATH (fast)
-		const pathResult = safeSpawn("sg", ["--version"], {
-			timeout: 5000,
-		});
-		if (!pathResult.error && pathResult.status === 0) {
-			this.sgPath = "sg";
-			this.available = true;
-			this.log("ast-grep found in PATH");
-			return true;
-		}
-
-		// Auto-install via pi-lens installer
-		this.log("ast-grep not found, attempting auto-install...");
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("ast-grep");
-
-		if (installedPath) {
-			this.sgPath = installedPath;
-			this.available = true;
-			this.log(`ast-grep auto-installed: ${installedPath}`);
-			return true;
-		}
-
-		this.available = false;
-		return false;
-	}
-
-	/**
-	 * Check if ast-grep CLI is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
+	 * Check if ast-grep CLI is available
 	 */
 	isAvailable(): boolean {
-		if (this.available !== null) return this.available;
-
-		this.available = isSgAvailable();
-		return this.available;
-	}
-
-	/**
-	 * Get the sg command to use (local binary or "sg" from PATH)
-	 */
-	private getSgCommand(): string {
-		return this.sgPath || "sg";
+		const result = spawnSync("npx", ["sg", "--version"], {
+			encoding: "utf-8",
+			timeout: 10000,
+			shell: true,
+		});
+		return !result.error && result.status === 0;
 	}
 
 	/**
@@ -110,46 +51,10 @@ export class SgRunner {
 	 */
 	async exec(args: string[]): Promise<SgResult> {
 		return new Promise((resolve) => {
-			// On Windows with Git Bash/MSYS2, we need to use bash to properly
-			// handle $variables in patterns (prevent shell expansion)
-			const isWindows = process.platform === "win32";
-			const hasBash = process.env.MSYSTEM || process.env.GIT_SHELL;
-
-			let proc;
-			if (isWindows && hasBash) {
-				// Use bash -c with properly escaped command
-				// In bash, use single quotes around arguments containing $ to prevent expansion
-				const escapedArgs = args.map((arg) => {
-					// For bash, wrap $-containing args in single quotes
-					if (arg.includes("$")) {
-						return `'${arg.replace(/'/g, "'\\''")}'`;
-					}
-					// For other args with spaces/special chars, use double quotes
-					if (/[\s"]/.test(arg)) {
-						return `"${arg.replace(/"/g, '\\"')}"`;
-					}
-					return arg;
-				});
-				const bashCommand = `${this.getSgCommand()} ${escapedArgs.join(" ")}`;
-				proc = spawn("bash", ["-c", bashCommand], {
-					stdio: ["ignore", "pipe", "pipe"],
-					windowsHide: true,
-				});
-			} else if (isWindows) {
-				// Fallback: use cmd.exe with standard escaping
-				const fullCommand = `${this.getSgCommand()} ${args.map(escapeWindowsArg).join(" ")}`;
-				proc = spawn(fullCommand, {
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: true,
-					windowsHide: true,
-				});
-			} else {
-				// Unix: normal spawn without shell
-				proc = spawn(this.getSgCommand(), args, {
-					stdio: ["ignore", "pipe", "pipe"],
-				});
-			}
-
+			const proc = spawn("npx", ["sg", ...args], {
+				stdio: ["ignore", "pipe", "pipe"],
+				shell: true,
+			});
 			let stdout = "";
 			let stderr = "";
 
@@ -169,30 +74,11 @@ export class SgRunner {
 
 			proc.on("close", (code: number | null) => {
 				if (code !== 0 && !stdout.trim()) {
-					// Enhanced error messages for common pattern issues
-					let errorMsg = stderr.trim() || `Exit code ${code}`;
-
-					if (stderr.includes("Multiple AST nodes are detected")) {
-						errorMsg =
-							`Invalid AST pattern: The pattern appears to contain multiple AST nodes or is malformed.\n` +
-							`Common causes:\n` +
-							`  1. Missing parentheses: use it($TEST) not it"test"\n` +
-							`  2. Raw text without structure: use console.log($MSG) not just "console.log"\n` +
-							`  3. Unclosed quotes or brackets\n\n` +
-							`Original error: ${errorMsg}`;
-					} else if (stderr.includes("Cannot parse query")) {
-						errorMsg =
-							`Pattern syntax error: The pattern could not be parsed as valid code.\n` +
-							`Tips:\n` +
-							`  - Patterns must be valid ${args.includes("--lang") ? args[args.indexOf("--lang") + 1] : "language"} syntax\n` +
-							`  - Use metavariables like $NAME, $ARGS for variable parts\n` +
-							`  - Example: 'function $NAME($$$PARAMS) { $$$BODY }'\n\n` +
-							`Original error: ${errorMsg}`;
-					}
-
 					resolve({
 						matches: [],
-						error: stderr.includes("No files found") ? undefined : errorMsg,
+						error: stderr.includes("No files found")
+							? undefined
+							: stderr.trim() || `Exit code ${code}`,
 					});
 					return;
 				}
@@ -215,9 +101,11 @@ export class SgRunner {
 	 * Run ast-grep synchronously (for simple scans)
 	 */
 	execSync(args: string[]): { output: string; error?: string } {
-		const { cmd: sgCmd, args: sgPre } = getSgCommand();
-		const result = safeSpawn(sgCmd, [...sgPre, "sg", ...args], {
+		const result = spawnSync("npx", ["sg", ...args], {
+			encoding: "utf-8",
 			timeout: 30000,
+			shell: true,
+			maxBuffer: 32 * 1024 * 1024,
 		});
 
 		if (result.error) {
@@ -249,46 +137,10 @@ export class SgRunner {
 			fs.writeFileSync(configFile, `ruleDirs:\n  - ./rules\n`);
 			fs.writeFileSync(ruleFile, ruleYaml);
 
-			const result = safeSpawn(
+			const result = spawnSync(
 				"npx",
 				["sg", "scan", "--config", configFile, "--json", dir],
-				{ timeout },
-			);
-
-			const output = result.stdout || result.stderr || "";
-			if (!output.trim()) return [];
-
-			const items = JSON.parse(output);
-			return Array.isArray(items) ? items : [items];
-		} catch {
-			return [];
-		} finally {
-			try {
-				fs.rmSync(sessionDir, { recursive: true, force: true });
-			} catch (err) {
-				this.log(`Cleanup failed: ${(err as Error).message}`);
-			}
-		}
-	}
-
-	/**
-	 * Run a rule file scan (temporary config approach) - alias for tempScan
-	 */
-	scanWithRule(ruleYaml: string, dir: string, timeout = 30000): SgMatch[] {
-		const sessionDir = path.join(os.tmpdir(), `sg-scan-${Date.now()}`);
-		const rulesSubdir = path.join(sessionDir, "rules");
-		const configFile = path.join(sessionDir, ".sgconfig.yml");
-		const ruleFile = path.join(rulesSubdir, "rule.yml");
-
-		try {
-			fs.mkdirSync(rulesSubdir, { recursive: true });
-			fs.writeFileSync(configFile, `ruleDirs:\n  - ./rules\n`);
-			fs.writeFileSync(ruleFile, ruleYaml);
-
-			const result = safeSpawn(
-				"npx",
-				["sg", "scan", "--config", configFile, "--json", dir],
-				{ timeout },
+				{ encoding: "utf-8", timeout, shell: true },
 			);
 
 			const output = result.stdout || result.stderr || "";
@@ -310,21 +162,8 @@ export class SgRunner {
 	/**
 	 * Format matches for display
 	 */
-	formatMatches(
-		matches: SgMatch[],
-		isDryRun = false,
-		maxItems = 50,
-		showModeIndicator = false,
-	): string {
-		if (matches.length === 0) {
-			if (showModeIndicator) {
-				return isDryRun
-					? "[DRY-RUN] No matches found."
-					: "[APPLIED] No changes made (no matches found).";
-			}
-			return "No matches found";
-		}
-
+	formatMatches(matches: SgMatch[], isDryRun = false, maxItems = 50): string {
+		if (matches.length === 0) return "No matches found";
 		const shown = matches.slice(0, maxItems);
 		const lines = shown.map((m) => {
 			const loc = `${m.file}:${m.range.start.line + 1}:${m.range.start.column + 1}`;
@@ -333,21 +172,11 @@ export class SgRunner {
 				? `${loc}\n  - ${text}\n  + ${m.replacement}`
 				: `${loc}: ${text}`;
 		});
-
 		if (matches.length > maxItems) {
 			lines.unshift(
 				`Found ${matches.length} matches (showing first ${maxItems}):`,
 			);
 		}
-
-		if (showModeIndicator) {
-			const prefix = isDryRun ? "[DRY-RUN]" : "[APPLIED]";
-			const suffix = isDryRun
-				? "\n\n(Dry run — use apply=true to apply changes)"
-				: "";
-			return `${prefix} ${matches.length} replacement(s):\n\n${lines.join("\n")}${suffix}`;
-		}
-
 		return lines.join("\n");
 	}
 }

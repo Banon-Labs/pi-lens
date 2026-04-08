@@ -6,7 +6,6 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { safeSpawn } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -117,8 +116,10 @@ export function isToolAvailable(toolName: string): boolean {
 	const tool = TOOL_REGISTRY.find((t) => t.name === toolName);
 	if (!tool) {
 		// Unknown tool - try direct command check
-		const result = safeSpawn(toolName, ["--version"], {
+		const result = spawnSync(toolName, ["--version"], {
+			encoding: "utf-8",
 			timeout: 5000,
+			shell: true,
 		});
 		const available = !result.error && result.status === 0;
 		TOOL_CACHE.set(toolName, {
@@ -133,8 +134,10 @@ export function isToolAvailable(toolName: string): boolean {
 
 	// Check using tool's version command
 	if (tool.versionCommand) {
-		const result = safeSpawn(tool.command, tool.versionCommand, {
+		const result = spawnSync(tool.command, tool.versionCommand, {
+			encoding: "utf-8",
 			timeout: 10000,
+			shell: true,
 		});
 		const available = !result.error && result.status === 0;
 		const output = result.stdout + result.stderr;
@@ -166,8 +169,10 @@ export function getToolVersion(toolName: string): string | undefined {
 	// Try to get version even if not cached
 	const tool = TOOL_REGISTRY.find((t) => t.name === toolName);
 	if (tool?.versionCommand) {
-		const result = safeSpawn(tool.command, tool.versionCommand, {
+		const result = spawnSync(tool.command, tool.versionCommand, {
+			encoding: "utf-8",
 			timeout: 10000,
+			shell: true,
 		});
 		if (!result.error && result.status === 0) {
 			const output = result.stdout + result.stderr;

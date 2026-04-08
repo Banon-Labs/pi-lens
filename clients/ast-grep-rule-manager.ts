@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { RuleDescription } from "./ast-grep-types.js";
+import type { RuleDescription } from "./ast-grep-client.js";
 
 export class AstGrepRuleManager {
 	private ruleDescriptions: Map<string, RuleDescription> | null = null;
@@ -78,15 +78,6 @@ export class AstGrepRuleManager {
 
 		const gradeMatch = content.match(/Grade\s+(\d+\.\d+)/i);
 		if (gradeMatch) result.grade = parseFloat(gradeMatch[1]);
-
-		const fixMatch = content.match(/^fix:\s*\|?([\s\S]*?)(?=^\w|^rule:|Z)/m);
-		if (fixMatch) {
-			result.fix = fixMatch[1]
-				.split("\n")
-				.map((line) => line.replace(/^\s*\|?\s*/, ""))
-				.filter((line) => line.length > 0)
-				.join("\n");
-		}
 
 		if (result.id && result.message) {
 			return result as RuleDescription;

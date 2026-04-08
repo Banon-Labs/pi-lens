@@ -9,9 +9,9 @@
  * Docs: https://github.com/pahen/madge
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawn } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -56,47 +56,15 @@ export class DependencyChecker {
 	}
 
 	/**
-	 * Check if madge is available, auto-install if not
-	 */
-	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.available !== null) return this.available;
-
-		// Check if available in PATH
-		const result = safeSpawn("madge", ["--version"], {
-			timeout: 5000,
-		});
-		this.available = !result.error && result.status === 0;
-
-		if (this.available) {
-			this.log(`Madge found: ${result.stdout?.trim()}`);
-			return true;
-		}
-
-		// Auto-install via pi-lens installer
-		this.log("Madge not found, attempting auto-install...");
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("madge");
-
-		if (installedPath) {
-			this.log(`Madge auto-installed: ${installedPath}`);
-			this.available = true;
-			return true;
-		}
-
-		this.log("Madge auto-install failed");
-		return false;
-	}
-
-	/**
-	 * Check if madge is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
+	 * Check if madge is available
 	 */
 	isAvailable(): boolean {
 		if (this.available !== null) return this.available;
 
-		const result = safeSpawn("npx", ["madge", "--version"], {
+		const result = spawnSync("npx", ["madge", "--version"], {
+			encoding: "utf-8",
 			timeout: 5000,
+			shell: true,
 		});
 
 		this.available = !result.error && result.status === 0;
@@ -255,7 +223,7 @@ export class DependencyChecker {
 
 		// Run madge on the specific file (fast)
 		try {
-			const result = safeSpawn(
+			const result = spawnSync(
 				"npx",
 				[
 					"madge",
@@ -266,8 +234,10 @@ export class DependencyChecker {
 					normalized,
 				],
 				{
+					encoding: "utf-8",
 					timeout: 15000,
 					cwd: projectRoot,
+					shell: true,
 				},
 			);
 
@@ -353,7 +323,7 @@ export class DependencyChecker {
 		}
 
 		try {
-			const result = safeSpawn(
+			const result = spawnSync(
 				"npx",
 				[
 					"madge",
@@ -364,8 +334,10 @@ export class DependencyChecker {
 					projectRoot,
 				],
 				{
+					encoding: "utf-8",
 					timeout: 30000,
 					cwd: projectRoot,
+					shell: true,
 				},
 			);
 

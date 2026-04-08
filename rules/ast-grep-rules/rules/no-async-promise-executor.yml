@@ -1,6 +1,6 @@
 id: no-async-promise-executor
 message: Promise executor functions should not be async.
-severity: error
+severity: warning
 language: TypeScript
 rule:
   all:

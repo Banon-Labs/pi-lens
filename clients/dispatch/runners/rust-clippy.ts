@@ -4,11 +4,8 @@
  * Runs `cargo clippy` for Rust files to catch common mistakes.
  */
 
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { safeSpawnAsync } from "../../safe-spawn.js";
+import { spawnSync } from "node:child_process";
 import { stripAnsi } from "../../sanitize.js";
-import { tryLazyInstall } from "./utils/lazy-installer.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -24,27 +21,14 @@ const rustClippyRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Check if cargo is available
-		const check = await safeSpawnAsync("cargo", ["--version"], {
+		const check = spawnSync("cargo", ["--version"], {
+			encoding: "utf-8",
 			timeout: 5000,
+			shell: true,
 		});
 
 		if (check.error || check.status !== 0) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
-		const clippyCheck = await safeSpawnAsync("cargo", ["clippy", "--version"], {
-			timeout: 8000,
-			cwd: ctx.cwd,
-		});
-		if (clippyCheck.error || clippyCheck.status !== 0) {
-			await tryLazyInstall("rust-clippy", ctx.cwd);
-			const retry = await safeSpawnAsync("cargo", ["clippy", "--version"], {
-				timeout: 8000,
-				cwd: ctx.cwd,
-			});
-			if (retry.error || retry.status !== 0) {
-				return { status: "skipped", diagnostics: [], semantic: "none" };
-			}
 		}
 
 		// Find the package root (where Cargo.toml is)
@@ -54,11 +38,13 @@ const rustClippyRunner: RunnerDefinition = {
 		}
 
 		// Run cargo clippy on the package
-		const result = await safeSpawnAsync(
+		const result = spawnSync(
 			"cargo",
 			["clippy", "--message-format=json", "-q"],
 			{
+				encoding: "utf-8",
 				timeout: 60000,
+				shell: true,
 				cwd: cargoToml.replace("Cargo.toml", ""),
 			},
 		);
@@ -82,18 +68,20 @@ const rustClippyRunner: RunnerDefinition = {
 			};
 		}
 
-		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
 		return {
-			status: hasErrors ? "failed" : "succeeded",
+			status: "failed",
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
+			semantic: "warning",
 		};
 	},
 };
 
 function findCargoToml(filePath: string): string | undefined {
-	let dir = dirname(filePath);
-	while (dir !== "/" && dir !== ".") {
+	const { dirname, join } = require("node:path");
+	const { existsSync } = require("node:fs");
+
+	let dir = filePath;
+	for (let i = 0; i < 10; i++) {
 		const cargoPath = join(dir, "Cargo.toml");
 		if (existsSync(cargoPath)) {
 			return cargoPath;
@@ -102,39 +90,38 @@ function findCargoToml(filePath: string): string | undefined {
 		if (parent === dir) break;
 		dir = parent;
 	}
-
 	return undefined;
 }
 
-function parseClippyOutput(raw: string, filePath: string): Diagnostic[] {
+function parseClippyOutput(raw: string, targetFile: string): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
-	const lines = raw.split("\n").filter((l) => l.trim());
+	const lines = raw.split("\n");
 
 	for (const line of lines) {
+		if (!line.trim()) continue;
+
 		try {
 			const msg = JSON.parse(line);
-			if (msg.reason !== "compiler-message") continue;
-
-			const message = msg.message;
-			if (!message) continue;
-
-			// Only include messages for this file or project-wide
-			const span = message.spans?.[0];
-			if (!span) continue;
-
-			diagnostics.push({
-				id: `clippy-${message.code?.code || "unknown"}`,
-				message: message.message || "Clippy warning",
-				filePath: span.file || filePath,
-				line: span.line_start || 0,
-				column: span.column_start || 0,
-				severity: message.level === "error" ? "error" : "warning",
-				semantic: message.level === "error" ? "blocking" : "warning",
-				tool: "rust-clippy",
-				rule: message.code?.code,
-			});
+			if (msg.message?.spans) {
+				for (const span of msg.message.spans) {
+					if (span.file_name?.includes(targetFile.replace(/\\/g, "/"))) {
+						const diagFilePath = targetFile;
+						diagnostics.push({
+							id: `clippy-${span.line_start || 0}-${msg.message.code?.code || "unknown"}`,
+							message: msg.message.message,
+							filePath: diagFilePath,
+							line: span.line_start,
+							column: span.column_start,
+							severity: msg.level === "error" ? "error" : "warning",
+							semantic: msg.level === "error" ? "blocking" : "warning",
+							tool: "clippy",
+							rule: msg.message.code?.code || "clippy",
+						});
+					}
+				}
+			}
 		} catch {
-			// Not a JSON line, skip
+			// Not JSON, skip
 		}
 	}
 

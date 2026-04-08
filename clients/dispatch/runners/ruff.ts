@@ -2,21 +2,16 @@
  * Ruff runner for dispatch system
  *
  * Ruff handles both formatting and linting for Python files.
- * Supports venv-local installations.
  */
 
-import { ensureTool } from "../../installer/index.js";
-import { safeSpawnAsync } from "../../safe-spawn.js";
+import { spawnSync } from "node:child_process";
 import { stripAnsi } from "../../sanitize.js";
 import type {
+	Diagnostic,
 	DispatchContext,
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { parseRuffOutput } from "./utils/diagnostic-parsers.js";
-import { createAvailabilityChecker } from "./utils/runner-helpers.js";
-
-const ruff = createAvailabilityChecker("ruff", ".exe");
 
 const ruffRunner: RunnerDefinition = {
 	id: "ruff-lint",
@@ -25,32 +20,26 @@ const ruffRunner: RunnerDefinition = {
 	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
-		let cmd: string | null = null;
+		// Check if ruff is available
+		const check = spawnSync("ruff", ["--version"], {
+			encoding: "utf-8",
+			timeout: 5000,
+			shell: true,
+		});
 
-		// Auto-install ruff if not available (it's one of the 4 auto-install tools)
-		if (ruff.isAvailable(cwd)) {
-			cmd = ruff.getCommand(cwd);
-		} else {
-			const installed = await ensureTool("ruff");
-			if (!installed) {
-				return { status: "skipped", diagnostics: [], semantic: "none" };
-			}
-			cmd = installed;
-		}
-
-		if (!cmd) {
+		if (check.error || check.status !== 0) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		// No --fix here: dispatch runners report issues for agent understanding,
-		// not silent correction. Auto-fix (ruff --fix) already runs in the
-		// format phase before dispatch, handling all safe style transforms.
-		// Silently rewriting here would leave the agent's context window stale.
-		const args = ["check", ctx.filePath];
+		// Run ruff check
+		const args = ctx.autofix
+			? ["check", "--fix", ctx.filePath]
+			: ["check", ctx.filePath];
 
-		const result = await safeSpawnAsync(cmd, args, {
+		const result = spawnSync("ruff", args, {
+			encoding: "utf-8",
 			timeout: 30000,
+			shell: true,
 		});
 
 		const raw = stripAnsi(result.stdout + result.stderr);
@@ -69,5 +58,31 @@ const ruffRunner: RunnerDefinition = {
 		};
 	},
 };
+
+function parseRuffOutput(raw: string, filePath: string): Diagnostic[] {
+	const lines = raw.split("\n").filter((l) => l.trim());
+	const diagnostics: Diagnostic[] = [];
+
+	for (const line of lines) {
+		// Parse ruff output: file:line:col: message (code)
+		const match = line.match(/^(.+?):(\d+):(\d+):\s*(.+?)\s+\((.+?)\)/);
+		if (match) {
+			diagnostics.push({
+				id: `ruff-${match[2]}-${match[5]}`,
+				message: `${match[5]}: ${match[4]}`,
+				filePath,
+				line: parseInt(match[2], 10),
+				column: parseInt(match[3], 10),
+				severity: line.includes("error") ? "error" : "warning",
+				semantic: "warning",
+				tool: "ruff",
+				rule: match[5],
+				fixable: true,
+			});
+		}
+	}
+
+	return diagnostics;
+}
 
 export default ruffRunner;

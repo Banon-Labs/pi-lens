@@ -5,19 +5,13 @@
  * - BLOCKING: Errors that stop the agent (architect, ts-lsp errors)
  * - WARNING: Non-blocking issues (biome warnings, type-safety)
  * - FIXABLE: Issues with auto-fix available
- * - SILENT: Metrics tracked but not shown (complexity)
+ * - SILENT: Metrics tracked but not shown (complexity, TDR)
  * - INFORMATIONAL: Shown in session summary only
  *
  * The dispatcher must handle these semantics consistently.
  */
 
 import type { FileKind } from "../file-kinds.js";
-import type { DefectClass } from "./diagnostic-taxonomy.js";
-
-export interface ModifiedRange {
-	start: number;
-	end: number;
-}
 
 // --- API Interface ---
 
@@ -54,15 +48,13 @@ export interface Diagnostic {
 	/** Column (1-based) */
 	column?: number;
 	/** Severity level */
-	severity: "error" | "warning" | "info" | "hint";
+	severity: "error" | "warning" | "info";
 	/** Output semantic */
 	semantic: OutputSemantic;
 	/** Which tool produced this */
 	tool: string;
 	/** Rule/category */
 	rule?: string;
-	/** Normalized defect class for overlap arbitration */
-	defectClass?: DefectClass;
 	/** Whether auto-fix is available */
 	fixable?: boolean;
 	/** Auto-fix command/suggestion */
@@ -70,18 +62,14 @@ export interface Diagnostic {
 }
 
 export interface DispatchResult {
-	/** All diagnostics found (delta-filtered for this run) */
+	/** All diagnostics found */
 	diagnostics: Diagnostic[];
-	/** Blockers that must be fixed (delta-filtered) */
+	/** Blockers that must be fixed */
 	blockers: Diagnostic[];
-	/** Warnings to address (delta-filtered — only NEW warnings this run) */
+	/** Warnings to address */
 	warnings: Diagnostic[];
-	/** Total warnings in baseline BEFORE this run (for cumulative count display) */
-	baselineWarningCount: number;
 	/** Issues that were auto-fixed */
 	fixed: Diagnostic[];
-	/** Count of previously-seen diagnostics that were resolved this run */
-	resolvedCount: number;
 	/** Formatted output for display */
 	output: string;
 	/** Whether any blockers were found */
@@ -108,8 +96,6 @@ export interface RunnerDefinition {
 	appliesTo: readonly FileKind[];
 	priority: number;
 	enabledByDefault: boolean;
-	/** Skip this runner for test files (false positive reduction) */
-	skipTestFiles?: boolean;
 	/** Check if runner should run */
 	when?: (ctx: DispatchContext) => Promise<boolean> | boolean;
 	/** Execute the runner */
@@ -136,9 +122,6 @@ export interface DispatchContext {
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;
 	readonly baselines: BaselineStore;
-	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
-	readonly blockingOnly?: boolean;
-	readonly modifiedRanges?: ModifiedRange[];
 
 	hasTool(command: string): Promise<boolean>;
 	log(message: string): void;

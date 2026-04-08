@@ -8,10 +8,10 @@
  * Docs: https://docs.astral.sh/ruff/
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isFileKind } from "./file-kinds.js";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -50,48 +50,16 @@ export class RuffClient {
 	}
 
 	/**
-	 * Check if ruff CLI is available, auto-install if not
-	 */
-	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked
-		if (this.ruffAvailable !== null) return this.ruffAvailable;
-
-		// Check if available in PATH
-		const result = safeSpawn("ruff", ["--version"], {
-			timeout: 5000,
-		});
-		this.ruffAvailable = !result.error && result.status === 0;
-
-		if (this.ruffAvailable) {
-			this.log(`Ruff found: ${result.stdout.trim()}`);
-			return true;
-		}
-
-		// Auto-install via pi-lens installer
-		this.log("Ruff not found, attempting auto-install...");
-		const { ensureTool } = await import("./installer/index.js");
-		const installedPath = await ensureTool("ruff");
-
-		if (installedPath) {
-			this.log(`Ruff auto-installed: ${installedPath}`);
-			this.ruffAvailable = true;
-			return true;
-		}
-
-		this.log("Ruff auto-install failed");
-		return false;
-	}
-
-	/**
-	 * Check if ruff CLI is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
+	 * Check if ruff CLI is available
 	 */
 	isAvailable(): boolean {
 		if (this.ruffAvailable !== null) return this.ruffAvailable;
 
 		try {
-			const result = safeSpawn("ruff", ["--version"], {
+			const result = spawnSync("ruff", ["--version"], {
+				encoding: "utf-8",
 				timeout: 5000,
+				shell: true,
 			});
 			this.ruffAvailable = !result.error && result.status === 0;
 			if (this.ruffAvailable) {
@@ -122,7 +90,7 @@ export class RuffClient {
 		if (!fs.existsSync(absolutePath)) return [];
 
 		try {
-			const result = safeSpawn(
+			const result = spawnSync(
 				"ruff",
 				[
 					"check",
@@ -133,7 +101,9 @@ export class RuffClient {
 					absolutePath,
 				],
 				{
+					encoding: "utf-8",
 					timeout: 10000,
+					shell: true,
 				},
 			);
 
@@ -158,11 +128,13 @@ export class RuffClient {
 		if (!fs.existsSync(absolutePath)) return "";
 
 		try {
-			const result = safeSpawn(
+			const result = spawnSync(
 				"ruff",
 				["format", "--check", "--diff", absolutePath],
 				{
+					encoding: "utf-8",
 					timeout: 10000,
+					shell: true,
 				},
 			);
 
@@ -215,8 +187,10 @@ export class RuffClient {
 			const beforeDiags = this.checkFile(filePath);
 			const fixableCount = beforeDiags.filter((d) => d.fixable).length;
 
-			const result = safeSpawn("ruff", ["check", "--fix", absolutePath], {
+			const result = spawnSync("ruff", ["check", "--fix", absolutePath], {
+				encoding: "utf-8",
 				timeout: 15000,
+				shell: true,
 			});
 
 			if (result.error) {
@@ -244,148 +218,6 @@ export class RuffClient {
 	}
 
 	/**
-	 * Async auto-fix variant for pipeline use (non-blocking spawn).
-	 */
-	async fixFileAsync(filePath: string): Promise<{
-		success: boolean;
-		changed: boolean;
-		fixed: number;
-		error?: string;
-	}> {
-		if (!(await this.ensureAvailable())) {
-			return {
-				success: false,
-				changed: false,
-				fixed: 0,
-				error: "Ruff not available",
-			};
-		}
-
-		const absolutePath = path.resolve(filePath);
-		if (!fs.existsSync(absolutePath)) {
-			return {
-				success: false,
-				changed: false,
-				fixed: 0,
-				error: "File not found",
-			};
-		}
-
-		try {
-			const before = await fs.promises.readFile(absolutePath, "utf-8");
-
-			const pre = await safeSpawnAsync(
-				"ruff",
-				[
-					"check",
-					"--output-format",
-					"json",
-					"--target-version",
-					"py310",
-					absolutePath,
-				],
-				{ timeout: 10000 },
-			);
-			const beforeDiags = pre.stdout?.trim()
-				? this.parseOutput(pre.stdout, absolutePath)
-				: [];
-			const fixableCount = beforeDiags.filter((d) => d.fixable).length;
-
-			const fix = await safeSpawnAsync(
-				"ruff",
-				["check", "--fix", absolutePath],
-				{ timeout: 15000 },
-			);
-
-			if (fix.error) {
-				return {
-					success: false,
-					changed: false,
-					fixed: 0,
-					error: fix.error.message,
-				};
-			}
-
-			const after = await fs.promises.readFile(absolutePath, "utf-8");
-			const changed = before !== after;
-
-			if (changed) {
-				this.log(
-					`Fixed ${fixableCount} issue(s) in ${path.basename(filePath)}`,
-				);
-			}
-
-			return { success: true, changed, fixed: fixableCount };
-		} catch (err: any) {
-			return { success: false, changed: false, fixed: 0, error: err.message };
-		}
-	}
-
-	/**
-	 * Fix multiple Python files at once (much faster than file-by-file)
-	 */
-	fixFiles(filePaths: string[]): {
-		success: boolean;
-		fixed: number;
-		changed: number;
-		error?: string;
-	} {
-		if (!this.isAvailable()) {
-			return {
-				success: false,
-				fixed: 0,
-				changed: 0,
-				error: "Ruff not available",
-			};
-		}
-
-		// Filter to existing Python files
-		const validFiles = filePaths
-			.map((f) => path.resolve(f))
-			.filter((f) => fs.existsSync(f) && f.endsWith(".py"));
-
-		if (validFiles.length === 0) {
-			return { success: true, fixed: 0, changed: 0 };
-		}
-
-		try {
-			// Count fixable issues before fixing
-			let totalFixable = 0;
-			for (const file of validFiles) {
-				const diags = this.checkFile(file);
-				totalFixable += diags.filter((d) => d.fixable).length;
-			}
-
-			// Run ruff once on all files - much faster than per file
-			const result = safeSpawn("ruff", ["check", "--fix", ...validFiles], {
-				timeout: 60000, // Longer timeout for batch
-			});
-
-			if (result.error) {
-				return {
-					success: false,
-					fixed: 0,
-					changed: 0,
-					error: result.error.message,
-				};
-			}
-
-			this.log(
-				`Fixed ${totalFixable} issue(s) in ${validFiles.length} file(s)`,
-			);
-
-			return { success: true, fixed: totalFixable, changed: validFiles.length };
-		} catch (err: any) {
-			return {
-				success: false,
-				fixed: 0,
-				changed: 0,
-				error: err.message,
-			};
-		}
-	}
-
-	/**
 	 * Format a Python file (writes to disk)
 	 */
 	formatFile(filePath: string): {
@@ -403,8 +235,10 @@ export class RuffClient {
 		const content = fs.readFileSync(absolutePath, "utf-8");
 
 		try {
-			const result = safeSpawn("ruff", ["format", absolutePath], {
+			const result = spawnSync("ruff", ["format", absolutePath], {
+				encoding: "utf-8",
 				timeout: 10000,
+				shell: true,
 			});
 
 			if (result.error) {

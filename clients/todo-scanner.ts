@@ -1,20 +1,19 @@
 /**
  * TODO Scanner for pi-local.
  *
- * Scans codebase for TODO, FIXME, HACK, XXX, and BUG annotations.
- * Helps understand what's already flagged as problematic or incomplete.
+ * Scans codebase for TODO, FIXME, HACK, XXX, and other annotations.
+ * Helps me understand what's already flagged as problematic or incomplete.
  *
  * No dependencies required — uses regex scanning.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { collectSourceFiles } from "./source-filter.js";
 
 // --- Types ---
 
 export interface TodoItem {
-	type: "TODO" | "FIXME" | "HACK" | "XXX" | "BUG";
+	type: "TODO" | "FIXME" | "HACK" | "XXX" | "NOTE" | "DEPRECATED" | "BUG";
 	message: string;
 	file: string;
 	line: number;
@@ -30,12 +29,8 @@ export interface TodoScanResult {
 // --- Scanner ---
 
 export class TodoScanner {
-	/**
-	 * Pattern matches actionable annotations only.
-	 * Excludes NOTE and DEPRECATED — these are documentation, not work items.
-	 * Case-sensitive to avoid matching "Note:" in prose.
-	 */
-	private readonly pattern = /\b(TODO|FIXME|HACK|XXX|BUG)\b\s*[(:]?\s*(.+)/g;
+	private readonly pattern =
+		/\b(TODO|FIXME|HACK|XXX|NOTE|DEPRECATED|BUG)\b\s*[(:]?\s*(.+)/gi;
 
 	/**
 	 * Check if a match position is inside a comment context.
@@ -85,7 +80,7 @@ export class TodoScanner {
 	}
 
 	/**
-	 * Scan a single file for TODOs.
+	 * Scan a single file for TODOs
 	 */
 	scanFile(filePath: string): TodoItem[] {
 		const absolutePath = path.resolve(filePath);
@@ -103,7 +98,7 @@ export class TodoScanner {
 				// Skip matches that aren't inside comments
 				if (!this.isInComment(line, match.index ?? 0)) continue;
 
-				const type = match[1] as TodoItem["type"];
+				const type = match[1].toUpperCase() as TodoItem["type"];
 				const message = (match[2] || "").trim().replace(/\s*\*\/\s*$/, ""); // Strip closing comment
 
 				items.push({
@@ -120,42 +115,60 @@ export class TodoScanner {
 	}
 
 	/**
-	 * Scan a list of pre-filtered files (recommended — uses source-filter module).
-	 * Callers should use collectSourceFiles() to get deduplicated source files.
+	 * Scan a directory recursively
 	 */
-	scanFiles(filePaths: string[]): TodoScanResult {
+	scanDirectory(
+		dirPath: string,
+		extensions = [".ts", ".tsx", ".js", ".jsx", ".py"],
+	): TodoScanResult {
 		const items: TodoItem[] = [];
+		const rootDir = path.resolve(dirPath);
 
-		for (const filePath of filePaths) {
-			// Skip this scanner file — its own type literals and regex cause false positives
-			if (
-				filePath.endsWith("todo-scanner.ts") ||
-				filePath.endsWith("todo-scanner.js")
-			)
-				continue;
-			// Skip test files — intentional annotations are test fixtures, not work items
-			if (/\.(test|spec)\.[jt]sx?$/.test(filePath)) continue;
+		const scan = (dir: string) => {
+			if (!fs.existsSync(dir)) return;
+			if (dir !== rootDir && fs.existsSync(path.join(dir, ".git"))) return;
 
-			items.push(...this.scanFile(filePath));
-		}
+			const entries = fs.readdirSync(dir, { withFileTypes: true });
 
-		return this.groupResults(items);
-	}
+			for (const entry of entries) {
+				const fullPath = path.join(dir, entry.name);
 
-	/**
-	 * Scan a directory recursively using the source-filter module to exclude build artifacts.
-	 * This is the preferred entry point for new callers.
-	 */
-	scanDirectory(dirPath: string): TodoScanResult {
-		// Use source-filter to collect only source files (no build artifacts)
-		const sourceFiles = collectSourceFiles(dirPath);
-		return this.scanFiles(sourceFiles);
-	}
+				if (entry.isDirectory()) {
+					// Skip common non-source directories
+					if (
+						[
+							"node_modules",
+							".git",
+							"dist",
+							"build",
+							".next",
+							"coverage",
+							".venv",
+							"venv",
+							"__pycache__",
+							".pytest_cache",
+							".mypy_cache",
+							".ruff_cache",
+						].includes(entry.name)
+					)
+						continue;
+					scan(fullPath);
+				} else if (extensions.some((ext) => entry.name.endsWith(ext))) {
+					// Skip this scanner file — its own type literals and regex cause false positives
+					if (
+						entry.name === "todo-scanner.ts" ||
+						entry.name === "todo-scanner.js"
+					)
+						continue;
+					// Skip test files — intentional annotations are test fixtures, not work items
+					if (/\.(test|spec)\.[jt]sx?$/.test(entry.name)) continue;
+					items.push(...this.scanFile(fullPath));
+				}
+			}
+		};
 
-	/**
-	 * Group scan results by type and file.
-	 */
-	private groupResults(items: TodoItem[]): TodoScanResult {
+		scan(path.resolve(dirPath));
+
 		// Group by type
 		const byType = new Map<string, TodoItem[]>();
 		for (const item of items) {
@@ -176,7 +189,7 @@ export class TodoScanner {
 	}
 
 	/**
-	 * Format scan results for LLM consumption.
+	 * Format scan results for LLM consumption
 	 */
 	formatResult(result: TodoScanResult, maxItems = 30): string {
 		if (result.items.length === 0) return "";
@@ -198,8 +211,10 @@ export class TodoScanner {
 			"FIXME",
 			"HACK",
 			"BUG",
+			"DEPRECATED",
 			"TODO",
 			"XXX",
+			"NOTE",
 		];
 		const sorted = [...result.items].sort((a, b) => {
 			const aIdx = priorityOrder.indexOf(a.type);
@@ -227,10 +242,14 @@ export class TodoScanner {
 				return "🟠";
 			case "BUG":
 				return "🐛";
+			case "DEPRECATED":
+				return "⚠️";
 			case "TODO":
 				return "📝";
 			case "XXX":
 				return "❌";
+			case "NOTE":
+				return "ℹ️";
 			default:
 				return "•";
 		}

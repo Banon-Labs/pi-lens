@@ -1,6 +1,6 @@
 id: array-callback-return
 message: return statements must be enforced in callbacks of array methods
-severity: error
+severity: warning
 language: TypeScript
 rule:
   all:

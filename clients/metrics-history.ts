@@ -9,7 +9,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
 
 // --- Types ---
 
@@ -20,8 +19,6 @@ export interface MetricSnapshot {
 	cognitive: number;
 	nesting: number;
 	lines: number;
-	maxCyclomatic: number; // NEW: worst function complexity
-	entropy: number; // NEW: code unpredictability in bits
 }
 
 export interface FileHistory {
@@ -50,6 +47,7 @@ const MAX_HISTORY_PER_FILE = 20;
  */
 function getCurrentCommit(): string {
 	try {
+		const { execSync } = require("node:child_process");
 		return execSync("git rev-parse --short HEAD", {
 			encoding: "utf-8",
 			timeout: 5000,
@@ -117,8 +115,6 @@ export function captureSnapshot(
 		cognitiveComplexity: number;
 		maxNestingDepth: number;
 		linesOfCode: number;
-		maxCyclomatic: number;
-		entropy: number;
 	},
 ): void {
 	// Use in-memory cache if available, otherwise load from disk
@@ -136,8 +132,6 @@ export function captureSnapshot(
 		cognitive: metrics.cognitiveComplexity,
 		nesting: metrics.maxNestingDepth,
 		lines: metrics.linesOfCode,
-		maxCyclomatic: metrics.maxCyclomatic,
-		entropy: Math.round(metrics.entropy * 100) / 100,
 	};
 
 	const existing = pendingHistory.files[relativePath];
@@ -186,8 +180,6 @@ export function captureSnapshots(
 			cognitiveComplexity: number;
 			maxNestingDepth: number;
 			linesOfCode: number;
-			maxCyclomatic: number;
-			entropy: number;
 		};
 	}>,
 ): MetricsHistory {
@@ -204,8 +196,6 @@ export function captureSnapshots(
 			cognitive: file.metrics.cognitiveComplexity,
 			nesting: file.metrics.maxNestingDepth,
 			lines: file.metrics.linesOfCode,
-			maxCyclomatic: file.metrics.maxCyclomatic,
-			entropy: Math.round(file.metrics.entropy * 100) / 100,
 		};
 
 		const existing = history.files[relativePath];
@@ -357,132 +347,4 @@ export function formatTrendCell(
 	const miColor = delta.mi > 0 ? "🟢" : delta.mi < 0 ? "🔴" : "⚪";
 
 	return `${emoji} ${miColor}${miSign}${delta.mi}`;
-}
-
-// --- Technical Debt Index (TDI) ---
-
-export interface ProjectTDI {
-	score: number; // 0-100, higher = more debt
-	grade: string; // A-F
-	avgMI: number;
-	totalCognitive: number;
-	filesAnalyzed: number;
-	filesWithDebt: number;
-	byCategory: {
-		maintainability: number; // 45% - MI-based
-		cognitive: number; // 30%
-		nesting: number; // 10%
-		maxCyclomatic: number; // 10% - NEW
-		entropy: number; // 5% - NEW
-	};
-}
-
-/**
- * Calculate Technical Debt Index for the project.
- * Score: 0 = perfect, 100 = maximum debt.
- */
-export function computeTDI(history: MetricsHistory): ProjectTDI {
-	const files = Object.values(history.files);
-	if (files.length === 0) {
-		return {
-			score: 0,
-			grade: "N/A",
-			avgMI: 100,
-			totalCognitive: 0,
-			filesAnalyzed: 0,
-			filesWithDebt: 0,
-			byCategory: {
-				maintainability: 0,
-				cognitive: 0,
-				nesting: 0,
-				maxCyclomatic: 0,
-				entropy: 0,
-			},
-		};
-	}
-
-	let totalMI = 0;
-	let totalCognitive = 0;
-	let _totalNesting = 0;
-	let filesWithDebt = 0;
-	let debtFromMI = 0;
-	let debtFromCognitive = 0;
-	let debtFromNesting = 0;
-	let debtFromMaxCyclomatic = 0; // NEW
-	let debtFromEntropy = 0; // NEW
-
-	for (const file of files) {
-		const snap = file.latest;
-		totalMI += snap.mi;
-		totalCognitive += snap.cognitive;
-		_totalNesting += snap.nesting;
-
-		// Accumulate debt points
-		let fileDebt = 0;
-
-		// MI debt: 0 at MI=100, max at MI=0
-		const miDebt = Math.max(0, (100 - snap.mi) / 100);
-		debtFromMI += miDebt;
-
-		// Cognitive debt: 0 at 0, max at 500+
-		const cogDebt = Math.min(1, snap.cognitive / 200);
-		debtFromCognitive += cogDebt;
-
-		// Nesting debt: 0 at 1-3, max at 10+
-		const nestDebt = Math.min(1, Math.max(0, snap.nesting - 3) / 7);
-		debtFromNesting += nestDebt;
-
-		// Max Cyclomatic debt: 0 at max<=10, 1 at max>=30
-		const maxCycDebt = Math.min(1, Math.max(0, snap.maxCyclomatic - 10) / 20);
-		debtFromMaxCyclomatic += maxCycDebt;
-
-		// Entropy debt: 0 at entropy<=4.0, 1 at entropy>=7.0
-		const entropyDebt = Math.min(1, Math.max(0, snap.entropy - 4.0) / 3.0);
-		debtFromEntropy += entropyDebt;
-
-		fileDebt = miDebt + cogDebt + nestDebt + maxCycDebt + entropyDebt;
-		if (fileDebt > 0.5) filesWithDebt++; // Lowered threshold since we have more factors
-	}
-
-	const avgMI = totalMI / files.length;
-
-	// Normalize to 0-100 scale
-	const avgMIDebt = debtFromMI / files.length; // 0-1
-	const avgCogDebt = debtFromCognitive / files.length; // 0-1
-	const avgNestDebt = debtFromNesting / files.length; // 0-1
-	const avgMaxCycDebt = debtFromMaxCyclomatic / files.length; // NEW
-	const avgEntropyDebt = debtFromEntropy / files.length; // NEW
-
-	// Weighted: MI (45%), cognitive (30%), nesting (10%), maxCyc (10%), entropy (5%)
-	const rawScore =
-		avgMIDebt * 45 +
-		avgCogDebt * 30 +
-		avgNestDebt * 10 +
-		avgMaxCycDebt * 10 +
-		avgEntropyDebt * 5;
-	const score = Math.round(rawScore * 100) / 100;
-
-	// Grade
-	let grade: string;
-	if (score <= 15) grade = "A";
-	else if (score <= 30) grade = "B";
-	else if (score <= 50) grade = "C";
-	else if (score <= 70) grade = "D";
-	else grade = "F";
-
-	return {
-		score,
-		grade,
-		avgMI: Math.round(avgMI * 10) / 10,
-		totalCognitive,
-		filesAnalyzed: files.length,
-		filesWithDebt,
-		byCategory: {
-			maintainability: Math.round(avgMIDebt * 100),
-			cognitive: Math.round(avgCogDebt * 100),
-			nesting: Math.round(avgNestDebt * 100),
-			maxCyclomatic: Math.round(avgMaxCycDebt * 100),
-			entropy: Math.round(avgEntropyDebt * 100),
-		},
-	};
 }

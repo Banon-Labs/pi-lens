@@ -1,6 +1,6 @@
 id: no-constructor-return
 message: Unexpected return statement in constructor.
-severity: error
+severity: warning
 language: TypeScript
 rule:
   any:

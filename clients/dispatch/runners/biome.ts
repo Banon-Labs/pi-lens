@@ -1,17 +1,14 @@
 /**
  * Biome runner for dispatch system
- *
- * Requires: @biomejs/biome (npm install -D @biomejs/biome)
  */
 
-import { safeSpawnAsync } from "../../safe-spawn.js";
+import { spawnSync } from "node:child_process";
 import type {
+	Diagnostic,
 	DispatchContext,
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { createBiomeParser } from "./utils/diagnostic-parsers.js";
-import { biome } from "./utils/runner-helpers.js";
 
 const biomeRunner: RunnerDefinition = {
 	id: "biome-lint",
@@ -20,40 +17,26 @@ const biomeRunner: RunnerDefinition = {
 	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
-		// Check if biome is available (via PATH, venv, or npx)
-		let cmd: string | null = null;
-		let useNpx = false;
+		// Check if biome is available
+		const check = spawnSync("npx", ["@biomejs/biome", "--version"], {
+			encoding: "utf-8",
+			timeout: 5000,
+			shell: true,
+		});
 
-		if (biome.isAvailable(cwd)) {
-			cmd = biome.getCommand(cwd);
+		if (check.error || check.status !== 0) {
+			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		if (!cmd) {
-			// Try npx as fallback
-			const npxCheck = await safeSpawnAsync("npx", ["biome", "--version"], {
-				timeout: 5000,
-				cwd,
-			});
-			if (!npxCheck.error && npxCheck.status === 0) {
-				cmd = "npx";
-				useNpx = true;
-			} else {
-				return { status: "skipped", diagnostics: [], semantic: "none" };
-			}
-		}
-
-		// No --write here: dispatch runners report issues for agent understanding,
-		// not silent correction. Auto-format (biome --write) already runs in the
-		// format phase before dispatch, handling all safe style transforms.
-		// Silently rewriting here would leave the agent's context window stale.
-		const args = useNpx
-			? ["biome", "check", ctx.filePath]
+		// Run biome check
+		const args = ctx.autofix
+			? ["check", "--write", ctx.filePath]
 			: ["check", ctx.filePath];
 
-		const result = await safeSpawnAsync(cmd, args, {
+		const result = spawnSync("npx", ["@biomejs/biome", ...args], {
+			encoding: "utf-8",
 			timeout: 30000,
-			cwd,
+			shell: true,
 		});
 
 		const output = result.stdout + result.stderr;
@@ -62,9 +45,8 @@ const biomeRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		// Parse diagnostics (never autofix in dispatch to prevent loops)
-		const parseBiomeOutput = createBiomeParser(false);
-		const diagnostics = parseBiomeOutput(output, ctx.filePath);
+		// Parse diagnostics
+		const diagnostics = parseBiomeOutput(output, ctx.filePath, ctx.autofix);
 
 		return {
 			status: "failed",
@@ -73,5 +55,39 @@ const biomeRunner: RunnerDefinition = {
 		};
 	},
 };
+
+function parseBiomeOutput(
+	raw: string,
+	filePath: string,
+	autofix: boolean,
+): Diagnostic[] {
+	const clean = raw.replace(/\x1b\[[0-9;]*m/g, "");
+	const lines = clean.split("\n").filter((l) => l.trim());
+	const diagnostics: Diagnostic[] = [];
+
+	for (const line of lines) {
+		// Parse biome output format: file:line:col message (category)
+		const match = line.match(/^(.+?):(\d+):(\d+)\s+(.+?)\s*\((.+?)\)/);
+		if (match) {
+			diagnostics.push({
+				id: `biome-${match[2]}-${match[5]}`,
+				message: `${match[5]}: ${match[4]}`,
+				filePath,
+				line: parseInt(match[2], 10),
+				column: parseInt(match[3], 10),
+				severity: line.includes("error") ? "error" : "warning",
+				semantic: "warning",
+				tool: "biome",
+				rule: match[5],
+				fixable: true,
+				fixSuggestion: autofix
+					? "Auto-fix applied"
+					: "Run with --autofix-biome to fix",
+			});
+		}
+	}
+
+	return diagnostics;
+}
 
 export default biomeRunner;

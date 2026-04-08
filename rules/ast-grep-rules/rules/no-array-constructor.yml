@@ -7,4 +7,3 @@ note: |
   new Array(n) which creates a sparse array of length n.
 rule:
   pattern: new Array($$$ARGS)
-fix: "[$$$ARGS]"

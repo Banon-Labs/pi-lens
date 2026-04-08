@@ -11,7 +11,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { normalizeMapKey } from "./path-utils.js";
 
 // --- Types ---
 
@@ -77,28 +76,6 @@ export class CacheManager {
 		this.log = verbose
 			? (msg: string) => console.error(`[cache] ${msg}`)
 			: () => {};
-	}
-
-	/**
-	 * Convert a file path to a stable turn-state key.
-	 * Uses normalized absolute paths first, then stores cwd-relative keys when possible.
-	 */
-	toTurnStateKey(filePath: string, cwd: string): string {
-		const cwdNorm = normalizeMapKey(path.resolve(cwd));
-		const fileNorm = normalizeMapKey(path.resolve(cwd, filePath));
-		const rel = path.relative(cwdNorm, fileNorm).replace(/\\/g, "/");
-		if (!rel || rel === ".") return fileNorm;
-		if (rel === ".." || rel.startsWith("../")) return fileNorm;
-		return rel;
-	}
-
-	/**
-	 * Get turn-state entry for a file path using normalized lookup.
-	 */
-	getTurnFileState(filePath: string, cwd: string): TurnFileState | undefined {
-		const state = this.readTurnState(cwd);
-		const key = this.toTurnStateKey(filePath, cwd);
-		return state.files[key];
 	}
 
 	// ---- Scanner Cache ----
@@ -251,7 +228,7 @@ export class CacheManager {
 		cwd: string,
 	): TurnState {
 		const state = this.readTurnState(cwd);
-		const normalizedPath = this.toTurnStateKey(filePath, cwd);
+		const normalizedPath = path.relative(cwd, filePath).replace(/\\/g, "/");
 
 		const existing = state.files[normalizedPath];
 		if (existing) {

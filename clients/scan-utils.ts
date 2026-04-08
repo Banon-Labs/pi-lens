@@ -1,7 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isExcludedDirName, isTestFile } from "./file-utils.js";
-import { collectSourceFiles, isBuildArtifact } from "./source-filter.js";
 
 /**
  * Common parsing logic for ast-grep JSON output (handles both array and NDJSON).
@@ -28,22 +26,15 @@ export function parseAstGrepJson(raw: string): any[] {
 
 /**
  * Check if a file should be ignored based on project type and common patterns.
- *
- * @deprecated Use `isBuildArtifact()` from `source-filter.js` instead for artifact
- * detection, or compose your own filter using `collectSourceFiles()`. This function
- * is kept for backward compatibility.
  */
 export function shouldIgnoreFile(
 	filePath: string,
 	isTsProject: boolean,
 ): boolean {
 	const relPath = filePath.replace(/\\/g, "/");
-	const _basename = path.basename(relPath);
+	const basename = path.basename(relPath);
 
-	// Use new source-filter module for artifact detection
-	if (isTsProject && isBuildArtifact(filePath)) return true;
-
-	// Legacy: simple JS check for non-TS projects (hand-written JS)
+	// Ignore compiled JS in TS projects
 	const isJs =
 		relPath.endsWith(".js") ||
 		relPath.endsWith(".mjs") ||
@@ -51,12 +42,24 @@ export function shouldIgnoreFile(
 	if (isTsProject && isJs) return true;
 
 	// Ignore test scripts and common test patterns
-	if (isTestFile(filePath)) return true;
+	if (
+		basename.startsWith("test-") ||
+		basename.includes(".test.") ||
+		basename.includes(".spec.")
+	) {
+		return true;
+	}
 
 	// Ignore hidden directories and common build outputs
-	const pathParts = relPath.split("/").filter(Boolean);
-	for (const segment of pathParts.slice(0, -1)) {
-		if (isExcludedDirName(segment)) return true;
+	if (
+		relPath.includes("/node_modules/") ||
+		relPath.includes("/.git/") ||
+		relPath.includes("/dist/") ||
+		relPath.includes("/build/") ||
+		relPath.includes("/.next/") ||
+		relPath.includes("/.pi-lens/")
+	) {
+		return true;
 	}
 
 	return false;
@@ -64,16 +67,46 @@ export function shouldIgnoreFile(
 
 /**
  * Recursively find source files in a directory, respecting common excludes.
- *
- * This function now delegates to `collectSourceFiles()` from the `source-filter`
- * module for unified artifact detection across all scanners.
- *
- * @param dir - Directory to scan
- * @param isTsProject - Deprecated parameter (kept for backward compatibility, not used)
- * @returns Array of absolute file paths that are source files (not build artifacts)
  */
-export function getSourceFiles(dir: string, _isTsProject?: boolean): string[] {
-	// Delegate to the unified source-filter module
-	// isTsProject parameter is no longer needed — artifact detection is automatic
-	return collectSourceFiles(dir);
+export function getSourceFiles(dir: string, isTsProject: boolean): string[] {
+	const files: string[] = [];
+	if (!fs.existsSync(dir)) return files;
+
+	const scan = (d: string) => {
+		let entries: fs.Dirent[] = [];
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entries) {
+			const full = path.join(d, entry.name);
+			if (entry.isDirectory()) {
+				if (
+					[
+						"node_modules",
+						".git",
+						"dist",
+						"build",
+						".next",
+						".pi-lens",
+					].includes(entry.name)
+				)
+					continue;
+				scan(full);
+			} else if (/\.(ts|tsx|js|jsx|py|go|rs)$/.test(entry.name)) {
+				// Skip compiled JS if it's a TS project
+				if (
+					isTsProject &&
+					entry.name.endsWith(".js") &&
+					fs.existsSync(full.replace(/\.js$/, ".ts"))
+				)
+					continue;
+				files.push(full);
+			}
+		}
+	};
+	scan(dir);
+	return files;
 }

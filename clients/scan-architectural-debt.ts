@@ -1,14 +1,14 @@
 /**
- * Shared architectural debt scanning.
+ * Shared architectural debt scanning — used by booboo-fix and booboo-refactor.
  * Scans ast-grep skip rules + complexity metrics + architect.yaml rules.
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ArchitectClient } from "./architect-client.js";
 import type { AstGrepClient } from "./ast-grep-client.js";
 import type { ComplexityClient } from "./complexity-client.js";
-import { safeSpawn } from "./safe-spawn.js";
 import { getSourceFiles, parseAstGrepJson } from "./scan-utils.js";
 
 export type SkipIssue = { rule: string; line: number; note: string };
@@ -28,7 +28,7 @@ export function scanSkipViolations(
 	const skipByFile = new Map<string, SkipIssue[]>();
 	if (!astGrepClient.isAvailable()) return skipByFile;
 
-	const sgResult = safeSpawn(
+	const sgResult = spawnSync(
 		"npx",
 		[
 			"sg",
@@ -48,7 +48,10 @@ export function scanSkipViolations(
 			targetPath,
 		],
 		{
+			encoding: "utf-8",
 			timeout: 30000,
+			shell: true,
+			maxBuffer: 32 * 1024 * 1024,
 		},
 	);
 

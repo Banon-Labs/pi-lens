@@ -1,0 +1,13 @@
+id: no-lonely-if
+language: TypeScript
+message: "Unexpected lonely 'if' — combine with the enclosing 'else' clause"
+severity: warning
+note: |
+  An 'if' statement as the sole statement in an 'else' block can be
+  combined into an 'else if' for better readability.
+rule:
+  all:
+    - pattern: if ($$$COND) { $$$BODY }
+    - inside:
+        kind: else_clause
+        stopBy: end

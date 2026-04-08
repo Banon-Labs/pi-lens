@@ -13,14 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AstGrepParser } from "./ast-grep-parser.js";
 import { AstGrepRuleManager } from "./ast-grep-rule-manager.js";
-import type {
-	AstGrepDiagnostic,
-	AstGrepMatch,
-	RuleDescription,
-	SgMatch,
-} from "./ast-grep-types.js";
-import { resolvePackagePath } from "./package-root.js";
-import { SgRunner } from "./sg-runner.js";
+import { type SgMatch, SgRunner } from "./sg-runner.js";
 
 const _getExtensionDir = () => {
 	if (typeof __dirname !== "undefined") {
@@ -28,6 +21,39 @@ const _getExtensionDir = () => {
 	}
 	return ".";
 };
+
+// --- Types ---
+
+export interface RuleDescription {
+	id: string;
+	message: string;
+	note?: string;
+	severity: "error" | "warning" | "info" | "hint";
+	grade?: number;
+}
+
+export interface AstGrepMatch {
+	file: string;
+	range: {
+		start: { line: number; column: number };
+		end: { line: number; column: number };
+	};
+	text: string;
+	replacement?: string;
+}
+
+export interface AstGrepDiagnostic {
+	line: number;
+	column: number;
+	endLine: number;
+	endColumn: number;
+	severity: "error" | "warning" | "info" | "hint";
+	message: string;
+	rule: string;
+	ruleDescription?: RuleDescription;
+	file: string;
+	fix?: string;
+}
 
 // --- Client ---
 
@@ -39,12 +65,7 @@ export class AstGrepClient {
 	private runner: SgRunner;
 
 	constructor(ruleDir?: string, verbose = false) {
-		const projectRuleDir = path.join(process.cwd(), "rules");
-		this.ruleDir =
-			ruleDir ||
-			(fs.existsSync(projectRuleDir)
-				? projectRuleDir
-				: resolvePackagePath(import.meta.url, "rules"));
+		this.ruleDir = ruleDir || path.join(process.cwd(), "rules");
 		this.log = verbose
 			? (msg: string) => console.error(`[ast-grep] ${msg}`)
 			: () => {};
@@ -53,15 +74,7 @@ export class AstGrepClient {
 	}
 
 	/**
-	 * Check if ast-grep CLI is available, auto-install if not
-	 */
-	async ensureAvailable(): Promise<boolean> {
-		return this.runner.ensureAvailable();
-	}
-
-	/**
-	 * Check if ast-grep CLI is available (legacy sync method)
-	 * Prefer ensureAvailable() for auto-install behavior
+	 * Check if ast-grep CLI is available
 	 */
 	isAvailable(): boolean {
 		if (this.available !== null) return this.available;
@@ -79,17 +92,16 @@ export class AstGrepClient {
 		pattern: string,
 		lang: string,
 		paths: string[],
-		options?: { selector?: string; context?: number },
 	): Promise<{ matches: AstGrepMatch[]; error?: string }> {
-		const args = ["run", "-p", pattern, "--lang", lang, "--json=compact"];
-		if (options?.selector) {
-			args.push("--selector", options.selector);
-		}
-		if (options?.context !== undefined) {
-			args.push("--context", String(options.context));
-		}
-		args.push(...paths);
-		return this.runner.exec(args);
+		return this.runner.exec([
+			"run",
+			"-p",
+			pattern,
+			"--lang",
+			lang,
+			"--json=compact",
+			...paths,
+		]);
 	}
 
 	/**
@@ -102,43 +114,21 @@ export class AstGrepClient {
 		paths: string[],
 		apply = false,
 	): Promise<{ matches: AstGrepMatch[]; applied: boolean; error?: string }> {
-		const baseArgs = ["run", "-p", pattern, "-r", rewrite, "--lang", lang];
-
-		if (!apply) {
-			// Dry-run: --json=compact shows what would change without writing
-			const result = await this.runner.exec([
-				...baseArgs,
-				"--json=compact",
-				...paths,
-			]);
-			return { matches: result.matches, applied: false, error: result.error };
-		}
-
-		// Apply: --update-all and --json are MUTUALLY EXCLUSIVE in sg.
-		// Run twice:
-		//   1. --update-all to actually write the files
-		//   2. --json=compact (without rewrite) to collect matches for display
-		const applyResult = await this.runner.exec([
-			...baseArgs,
-			"--update-all",
-			...paths,
-		]);
-		if (applyResult.error) {
-			return { matches: [], applied: false, error: applyResult.error };
-		}
-
-		// Search for what was changed (pattern no longer matches after rewrite,
-		// so search for the rewrite pattern to show what was applied)
-		const searchResult = await this.runner.exec([
+		const args = [
 			"run",
 			"-p",
+			pattern,
+			"-r",
 			rewrite,
 			"--lang",
 			lang,
 			"--json=compact",
-			...paths,
-		]);
-		return { matches: searchResult.matches, applied: true, error: undefined };
+		];
+		if (apply) args.push("--update-all");
+		args.push(...paths);
+
+		const result = await this.runner.exec(args);
+		return { matches: result.matches, applied: apply, error: result.error };
 	}
 
 	/**
@@ -149,7 +139,7 @@ export class AstGrepClient {
 		ruleId: string,
 		ruleYaml: string,
 		timeout = 30000,
-	): AstGrepMatch[] {
+	): any[] {
 		if (!this.isAvailable()) return [];
 		return this.runner.tempScan(dir, ruleId, ruleYaml, timeout);
 	}
@@ -180,7 +170,7 @@ message: found
 		return this.groupSimilarFunctions(matches);
 	}
 
-	private groupSimilarFunctions(matches: AstGrepMatch[]): Array<{
+	private groupSimilarFunctions(matches: any[]): Array<{
 		pattern: string;
 		functions: Array<{ name: string; file: string; line: number }>;
 	}> {
@@ -267,17 +257,8 @@ message: found
 		return exports;
 	}
 
-	formatMatches(
-		matches: AstGrepMatch[],
-		isDryRun = false,
-		showModeIndicator = false,
-	): string {
-		return this.runner.formatMatches(
-			matches as SgMatch[],
-			isDryRun,
-			50,
-			showModeIndicator,
-		);
+	formatMatches(matches: AstGrepMatch[], isDryRun = false): string {
+		return this.runner.formatMatches(matches as SgMatch[], isDryRun);
 	}
 
 	/**
@@ -298,7 +279,7 @@ message: found
 				{
 					encoding: "utf-8",
 					timeout: 15000,
-					shell: process.platform === "win32",
+					shell: true,
 				},
 			);
 
@@ -311,10 +292,8 @@ message: found
 				(sev) => this.mapSeverity(sev),
 			);
 			return parser.parseOutput(output, absolutePath);
-		} catch (err) {
-			this.log(
-				`Scan error: ${err instanceof Error ? err.message : String(err)}`,
-			);
+		} catch (err: any) {
+			this.log(`Scan error: ${err.message}`);
 			return [];
 		}
 	}

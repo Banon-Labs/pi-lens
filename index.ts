@@ -1,9 +1,9 @@
 import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 import { AgentBehaviorClient } from "./clients/agent-behavior-client.js";
 import { ArchitectClient } from "./clients/architect-client.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
@@ -11,38 +11,72 @@ import { BiomeClient } from "./clients/biome-client.js";
 import { CacheManager } from "./clients/cache-manager.js";
 import { ComplexityClient } from "./clients/complexity-client.js";
 import { DependencyChecker } from "./clients/dependency-checker.js";
-import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
-import {
-	getLatencyReports,
-	resetDispatchBaselines,
-} from "./clients/dispatch/integration.js";
-import { extractFunctions } from "./clients/dispatch/runners/similarity.js";
-import { resetFormatService } from "./clients/format-service.js";
-import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./clients/git-guard.js";
+import { dispatchLint } from "./clients/dispatch/integration.js";
 import { GoClient } from "./clients/go-client.js";
-import { ensureTool } from "./clients/installer/index.js";
+import { buildInterviewer } from "./clients/interviewer.js";
 import { JscpdClient } from "./clients/jscpd-client.js";
 import { KnipClient } from "./clients/knip-client.js";
-import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import { MetricsClient } from "./clients/metrics-client.js";
-import { captureSnapshot } from "./clients/metrics-history.js";
-import { findSimilarFunctions } from "./clients/project-index.js";
+import {
+	captureSnapshot,
+	captureSnapshots,
+	formatTrendCell,
+	getTrendSummary,
+} from "./clients/metrics-history.js";
 import { RuffClient } from "./clients/ruff-client.js";
-import { RuntimeCoordinator } from "./clients/runtime-coordinator.js";
-import { consumeTurnEndFindings } from "./clients/runtime-context.js";
-import { handleSessionStart } from "./clients/runtime-session.js";
-import { handleToolResult } from "./clients/runtime-tool-result.js";
-import { handleTurnEnd } from "./clients/runtime-turn.js";
-import { formatRulesForPrompt } from "./clients/rules-scanner.js";
+import {
+	formatRulesForPrompt,
+	type RuleScanResult,
+	scanProjectRules,
+} from "./clients/rules-scanner.js";
 import { RustClient } from "./clients/rust-client.js";
+import { getSourceFiles } from "./clients/scan-utils.js";
 import { TestRunnerClient } from "./clients/test-runner-client.js";
 import { TodoScanner } from "./clients/todo-scanner.js";
 import { TypeCoverageClient } from "./clients/type-coverage-client.js";
 import { TypeScriptClient } from "./clients/typescript-client.js";
 import { handleBooboo } from "./commands/booboo.js";
-import { createAstGrepReplaceTool } from "./tools/ast-grep-replace.js";
-import { createAstGrepSearchTool } from "./tools/ast-grep-search.js";
-import { createLspNavigationTool } from "./tools/lsp-navigation.js";
+import { handleFix } from "./commands/fix.js";
+import { handleRefactor, initRefactorLoop } from "./commands/refactor.js";
+
+/** Parse a diff to extract modified line ranges in the new file.
+ * Handles pi's custom diff format:
+ *   "   1 /**"          - unchanged line with line number
+ *   "-  2 * old text"   - removed line
+ *   "+  2 * new text"   - added line
+ *   "     ..."          - skipped section
+ */
+function parseDiffRanges(diff: string): { start: number; end: number }[] {
+	const changedLines: number[] = [];
+	for (const line of diff.split("\n")) {
+		// Match lines like "+  2 * new text" or "-  2 * old text"
+		const match = line.match(/^[+-]\s+(\d+)\s/);
+		if (match) {
+			changedLines.push(Number.parseInt(match[1], 10));
+		}
+	}
+
+	if (changedLines.length === 0) return [];
+
+	// Convert to ranges (merge adjacent lines)
+	const sorted = [...new Set(changedLines)].sort((a, b) => a - b);
+	const ranges: { start: number; end: number }[] = [];
+	let rangeStart = sorted[0];
+	let rangeEnd = sorted[0];
+
+	for (const line of sorted.slice(1)) {
+		if (line <= rangeEnd + 1) {
+			rangeEnd = line;
+		} else {
+			ranges.push({ start: rangeStart, end: rangeEnd });
+			rangeStart = line;
+			rangeEnd = line;
+		}
+	}
+	ranges.push({ start: rangeStart, end: rangeEnd });
+
+	return ranges;
+}
 
 const _getExtensionDir = () => {
 	if (typeof __dirname !== "undefined") {
@@ -57,7 +91,6 @@ function dbg(msg: string) {
 	try {
 		nodeFs.appendFileSync(DEBUG_LOG, line);
 	} catch (e) {
-		// Pipeline error logged
 		console.error("[pi-lens-debug] write failed:", e);
 	}
 }
@@ -65,66 +98,16 @@ function dbg(msg: string) {
 // --- State ---
 
 let _verbose = false;
-const runtime = new RuntimeCoordinator();
+let projectRoot = process.cwd();
+
+// Error debt tracking: baseline at turn start
+let errorDebtBaseline: {
+	testsPassed: boolean;
+	buildPassed: boolean;
+} | null = null;
 
 function log(msg: string) {
 	if (_verbose) console.error(`[pi-lens] ${msg}`);
-}
-
-function updateRuntimeIdentityFromEvent(event: unknown): void {
-	const raw = event as {
-		provider?: string;
-		model?: string;
-		sessionId?: string;
-		session?: { id?: string };
-		id?: string;
-	};
-	runtime.setTelemetryIdentity({
-		provider: raw.provider,
-		model: raw.model,
-		sessionId: raw.sessionId ?? raw.session?.id ?? raw.id,
-	});
-}
-
-/**
- * Find and delete stale tsconfig.tsbuildinfo files in the project.
- *
- * A tsbuildinfo is stale when its `root` array references files that no
- * longer exist on disk. The TypeScript Language Server reads this cache
- * on startup and will report phantom "Cannot find module" errors for
- * every deleted file until the cache is cleared.
- *
- * Only called when --lens-lsp is active (that’s when tsserver runs).
- */
-function cleanStaleTsBuildInfo(cwd: string): string[] {
-	const cleaned: string[] = [];
-	try {
-		// Find all tsbuildinfo files in the project (max depth 3 to avoid crawling)
-		const candidates = nodeFs
-			.readdirSync(cwd)
-			.filter((f) => f.endsWith(".tsbuildinfo"))
-			.map((f) => path.join(cwd, f));
-
-		for (const infoPath of candidates) {
-			try {
-				const data = JSON.parse(nodeFs.readFileSync(infoPath, "utf-8"));
-				const root: string[] = data.root ?? [];
-				const dir = path.dirname(infoPath);
-				const isStale = root.some(
-					(f) => !nodeFs.existsSync(path.resolve(dir, f)),
-				);
-				if (isStale) {
-					nodeFs.unlinkSync(infoPath);
-					cleaned.push(infoPath);
-				}
-			} catch {
-				// Malformed or unreadable — skip
-			}
-		}
-	} catch {
-		// readdirSync failed — skip
-	}
-	return cleaned;
 }
 
 // --- Extension ---
@@ -148,6 +131,9 @@ export default function (pi: ExtensionAPI) {
 	const agentBehaviorClient = new AgentBehaviorClient();
 	const cacheManager = new CacheManager();
 
+	// --- Initialize auto-loops (must be early for event handlers) ---
+	initRefactorLoop(pi);
+
 	// --- Flags ---
 
 	pi.registerFlag("lens-verbose", {
@@ -158,12 +144,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerFlag("no-biome", {
 		description: "Disable Biome linting/formatting",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-oxlint", {
-		description: "Disable Oxlint fast JS/TS linter",
 		type: "boolean",
 		default: false,
 	});
@@ -180,15 +160,8 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.registerFlag("no-shellcheck", {
-		description: "Disable shellcheck for shell scripts",
-		type: "boolean",
-		default: false,
-	});
-
 	pi.registerFlag("no-lsp", {
-		description:
-			"Disable unified LSP diagnostics and use language-specific fallbacks (for example ts-lsp, pyright)",
+		description: "Disable TypeScript LSP",
 		type: "boolean",
 		default: false,
 	});
@@ -199,32 +172,17 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.registerFlag("no-autoformat", {
+	pi.registerFlag("autofix-biome", {
 		description:
-			"Disable automatic formatting on file write (formatters run by default)",
+			"Auto-fix Biome lint/format issues on write (applies --write --unsafe)",
 		type: "boolean",
 		default: false,
 	});
 
-	pi.registerFlag("no-autofix", {
-		description:
-			"Disable auto-fixing of lint issues (Biome, Ruff). Use --no-autofix-biome or --no-autofix-ruff for individual control.",
+	pi.registerFlag("autofix-ruff", {
+		description: "Auto-fix Ruff lint/format issues on write",
 		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-autofix-biome", {
-		description:
-			"Disable Biome auto-fix on write (Biome autofix is enabled by default)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("no-autofix-ruff", {
-		description:
-			"Disable Ruff auto-fix on write (Ruff autofix is enabled by default)",
-		type: "boolean",
-		default: false,
+		default: true,
 	});
 
 	pi.registerFlag("no-tests", {
@@ -252,42 +210,6 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.registerFlag("lens-lsp", {
-		description:
-			"Enable LSP (Language Server Protocol) for semantic analysis (Phase 3)",
-		type: "boolean",
-		default: true,
-	});
-
-	pi.registerFlag("auto-install", {
-		description:
-			"Auto-install missing LSP servers without prompting (for Go, Rust, YAML, JSON, Bash)",
-		type: "boolean",
-		default: false,
-	});
-
-	// Internal flag for running only blocking rules on file write (performance)
-	pi.registerFlag("lens-blocking-only", {
-		description:
-			"[Internal] Only run BLOCKING rules (severity: error) for fast feedback",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("lens-eslint-core", {
-		description:
-			"Use bundled ESLint core rules when project has no ESLint config (JS-only fallback)",
-		type: "boolean",
-		default: false,
-	});
-
-	pi.registerFlag("lens-guard", {
-		description:
-			"Experimental: block git commit/push when unresolved pi-lens blockers exist",
-		type: "boolean",
-		default: false,
-	});
-
 	// --- Commands ---
 
 	pi.registerCommand("lens-booboo", {
@@ -311,431 +233,1027 @@ export default function (pi: ExtensionAPI) {
 			),
 	});
 
-	// DISABLED: lens-booboo-fix command - disabled per user request
-
-	pi.registerCommand("lens-tdi", {
-		description:
-			"Show Technical Debt Index (TDI) and project health trend. Usage: /lens-tdi",
-		handler: async (_args, ctx) => {
-			const { loadHistory, computeTDI } = await import(
-				"./clients/metrics-history.js"
-			);
-			const history = loadHistory();
-			const tdi = computeTDI(history);
-
-			const lines = [
-				`📊 TECHNICAL DEBT INDEX: ${tdi.score}/100 (${tdi.grade})`,
-				``,
-				`Files analyzed: ${tdi.filesAnalyzed}`,
-				`Files with debt: ${tdi.filesWithDebt}`,
-				`Avg MI: ${tdi.avgMI}`,
-				`Total cognitive complexity: ${tdi.totalCognitive}`,
-				``,
-				`Debt breakdown:`,
-				`  Maintainability: ${tdi.byCategory.maintainability}% (MI-based)`,
-				`  Cognitive: ${tdi.byCategory.cognitive}%`,
-				`  Nesting: ${tdi.byCategory.nesting}%`,
-				`  Max Cyclomatic: ${tdi.byCategory.maxCyclomatic}% (worst function)`,
-				`  Entropy: ${tdi.byCategory.entropy}% (code unpredictability)`,
-				``,
-				tdi.score <= 30
-					? "✅ Codebase is healthy!"
-					: tdi.score <= 60
-						? "⚠️ Moderate debt — consider refactoring"
-						: "🔴 High debt — run /lens-booboo-refactor",
-			];
-
-			ctx.ui.notify(lines.join("\n"), "info");
+	// --- Rule action map for lens-booboo-fix ---
+	// Rules marked "skip" are architectural — they need deliberate user decisions.
+	// They are excluded from inline tool_result hard stops (use /lens-refactor instead).
+	const RULE_ACTIONS: Record<
+		string,
+		{ type: "biome" | "agent" | "skip"; note: string }
+	> = {
+		"no-lonely-if": { type: "biome", note: "auto-fixed by Biome --write" },
+		"empty-catch": {
+			type: "agent",
+			note: "Add this.log('Error: ' + err.message) to the catch block",
 		},
+		"no-console-log": {
+			type: "agent",
+			note: "Remove or replace with class logger method",
+		},
+		"no-debugger": { type: "agent", note: "Remove the debugger statement" },
+		"no-return-await": {
+			type: "agent",
+			note: "Remove the unnecessary `return await`",
+		},
+		"nested-ternary": {
+			type: "agent",
+			note: "Extract to if/else or a named variable",
+		},
+		"no-throw-string": {
+			type: "agent",
+			note: "Wrap in `new Error(...)` instead of throwing a string",
+		},
+		"no-star-imports": {
+			type: "skip",
+			note: "Requires knowing which exports are actually used.",
+		},
+		"no-as-any": {
+			type: "skip",
+			note: "Replacing `as any` requires knowing the correct type.",
+		},
+		"no-non-null-assertion": {
+			type: "skip",
+			note: "Each `!` needs nullability analysis in context.",
+		},
+		"large-class": {
+			type: "skip",
+			note: "Splitting a class requires architectural decisions.",
+		},
+		"long-method": {
+			type: "skip",
+			note: "Extraction requires understanding the function's purpose.",
+		},
+		"long-parameter-list": {
+			type: "skip",
+			note: "Redesigning the signature requires an API decision.",
+		},
+		"no-shadow": {
+			type: "skip",
+			note: "Renaming requires understanding all variable scopes.",
+		},
+		"no-process-env": {
+			type: "skip",
+			note: "Using process.env directly makes code untestable. Use DI or a config module.",
+		},
+		"no-param-reassign": {
+			type: "agent",
+			note: "Create a new variable instead of reassigning the parameter.",
+		},
+		"no-single-char-var": {
+			type: "skip",
+			note: "Renaming requires understanding the variable's purpose.",
+		},
+		"switch-without-default": {
+			type: "agent",
+			note: "Add a default case to handle unexpected values.",
+		},
+		"no-architecture-violation": {
+			type: "skip",
+			note: "Layer boundary violations require architectural decisions.",
+		},
+		"switch-exhaustiveness": {
+			type: "agent",
+			note: "Add the missing case(s) or a default clause to handle all union values.",
+		},
+	};
+
+	// Derived from RULE_ACTIONS — used to suppress architectural rules from inline hard stops.
+	const SKIP_RULES = new Set(
+		Object.entries(RULE_ACTIONS)
+			.filter(([, v]) => v.type === "skip")
+			.map(([k]) => k),
+	);
+
+	pi.registerCommand("lens-booboo-fix", {
+		description:
+			"Iterative fix loop: auto-fixes Biome/Ruff, then generates a per-issue plan for agent to execute. Run repeatedly until clean. Usage: /lens-booboo-fix [path] [--reset]",
+		handler: (args, ctx) =>
+			handleFix(
+				args,
+				ctx,
+				{
+					tsClient,
+					astGrep: astGrepClient,
+					ruff: ruffClient,
+					biome: biomeClient,
+					knip: knipClient,
+					jscpd: jscpdClient,
+					complexity: complexityClient,
+				},
+				pi,
+				RULE_ACTIONS,
+			),
 	});
 
-	pi.registerCommand("lens-health", {
+	pi.registerCommand("lens-booboo-refactor", {
 		description:
-			"Show pi-lens runtime health: pipeline crashes, slow runners, and last dispatch latency. Usage: /lens-health",
-		handler: async (_args, ctx) => {
-			const crashEntries = runtime.getCrashEntries().sort(
-				(a, b) => b[1] - a[1],
+			"Interactive architectural refactor: scans for worst offender, opens a browser interview with options + recommendation, then steers the agent with your decision. Usage: /lens-booboo-refactor [path]",
+		handler: (args, ctx) =>
+			handleRefactor(
+				args,
+				ctx,
+				{
+					astGrep: astGrepClient,
+					complexity: complexityClient,
+					architect: architectClient,
+				},
+				pi,
+				SKIP_RULES,
+				RULE_ACTIONS,
+			),
+	});
+
+	pi.registerCommand("lens-metrics", {
+		description:
+			"Measure complexity metrics for all files and export to report.md. Usage: /lens-metrics [path]",
+		handler: async (args, ctx) => {
+			const targetPath = args.trim() || ctx.cwd || process.cwd();
+			ctx.ui.notify("📊 Measuring code metrics...", "info");
+
+			const reviewDir = path.join(process.cwd(), ".pi-lens", "reviews");
+			const timestamp = new Date()
+				.toISOString()
+				.replace(/[:.]/g, "-")
+				.slice(0, 19);
+			const projectName = path.basename(process.cwd());
+
+			const results: import("./clients/complexity-client.js").FileComplexity[] =
+				[];
+
+			const isTsProject = nodeFs.existsSync(
+				path.join(targetPath, "tsconfig.json"),
 			);
-			const totalCrashes = crashEntries.reduce((sum, [, count]) => sum + count, 0);
-
-			const reports = getLatencyReports();
-			const last = reports.length > 0 ? reports[reports.length - 1] : undefined;
-			const diagStats = getDiagnosticTracker().getStats();
-			const slowRunners = last
-				? [...last.runners]
-						.sort((a, b) => b.durationMs - a.durationMs)
-						.slice(0, 3)
-				: [];
-
-			const lines: string[] = [
-				"🩺 PI-LENS HEALTH",
-				"",
-				`Pipeline crashes (session): ${totalCrashes}`,
-				`Files affected: ${crashEntries.length}`,
-			];
-
-			if (crashEntries.length > 0) {
-				lines.push("", "Top crash files:");
-				for (const [file, count] of crashEntries.slice(0, 5)) {
-					lines.push(`  ${path.basename(file)}: ${count}`);
-				}
-			}
-
-			if (last) {
-				lines.push(
-					"",
-					`Last dispatch: ${path.basename(last.filePath)} (${last.totalDurationMs}ms, ${last.totalDiagnostics} diagnostics)`,
-				);
-				if (slowRunners.length > 0) {
-					lines.push("Top runners (last dispatch):");
-					for (const runner of slowRunners) {
-						lines.push(
-							`  ${runner.runnerId}: ${runner.durationMs}ms (${runner.status})`,
-						);
+			const files = getSourceFiles(targetPath, isTsProject);
+			for (const fullPath of files) {
+				if (complexityClient.isSupportedFile(fullPath)) {
+					const metrics = complexityClient.analyzeFile(fullPath);
+					if (metrics) {
+						results.push(metrics);
 					}
 				}
-			} else {
-				lines.push("", "No dispatch latency reports yet.");
 			}
 
-			lines.push(
-				"",
-				`Diagnostics shown: ${diagStats.totalShown}`,
-				`Auto-fixed: ${diagStats.totalAutoFixed}`,
-				`Agent-fixed: ${diagStats.totalAgentFixed}`,
-				`Unresolved carryover: ${diagStats.totalUnresolved}`,
+			if (results.length === 0) {
+				ctx.ui.notify("No supported files found to analyze", "warning");
+				return;
+			}
+
+			// Calculate aggregates
+			const avgMI =
+				results.reduce((a, b) => a + b.maintainabilityIndex, 0) /
+				results.length;
+			const avgCognitive =
+				results.reduce((a, b) => a + b.cognitiveComplexity, 0) / results.length;
+			const avgCyclomatic =
+				results.reduce((a, b) => a + b.cyclomaticComplexity, 0) /
+				results.length;
+			const avgFunctionLength =
+				results.reduce((a, b) => a + b.avgFunctionLength, 0) / results.length;
+			const maxNesting = Math.max(...results.map((r) => r.maxNestingDepth));
+			const maxCognitive = Math.max(
+				...results.map((r) => r.cognitiveComplexity),
+			);
+			const minMI = Math.min(...results.map((r) => r.maintainabilityIndex));
+			const totalFunctions = results.reduce((a, b) => a + b.functionCount, 0);
+			const totalLOC = results.reduce((a, b) => a + b.linesOfCode, 0);
+
+			// Grade distribution
+			const grades = results.map((r) => {
+				const mi = r.maintainabilityIndex;
+				if (mi >= 80) return { letter: "A", color: "🟢" };
+				if (mi >= 60) return { letter: "B", color: "🟡" };
+				if (mi >= 40) return { letter: "C", color: "🟠" };
+				if (mi >= 20) return { letter: "D", color: "🔴" };
+				return { letter: "F", color: "⚫" };
+			});
+
+			const gradeCount = { A: 0, B: 0, C: 0, D: 0, F: 0 };
+			for (const g of grades) {
+				gradeCount[g.letter as keyof typeof gradeCount]++;
+			}
+
+			// Capture snapshots for history tracking
+			const history = captureSnapshots(
+				results.map((r) => ({
+					filePath: r.filePath,
+					metrics: {
+						maintainabilityIndex: r.maintainabilityIndex,
+						cognitiveComplexity: r.cognitiveComplexity,
+						maxNestingDepth: r.maxNestingDepth,
+						linesOfCode: r.linesOfCode,
+					},
+				})),
 			);
 
-			if (diagStats.repeatOffenders.length > 0) {
-				lines.push("Repeat offenders:");
-				for (const offender of diagStats.repeatOffenders.slice(0, 5)) {
-					lines.push(
-						`  ${path.basename(offender.filePath)}:${offender.line} ${offender.ruleId} (${offender.count}x)`,
-					);
+			// Build report
+			let report = `# Code Metrics Report: ${projectName}\n\n`;
+			report += `**Generated:** ${new Date().toISOString()}\n\n`;
+			report += `**Path:** \`${targetPath}\`\n\n`;
+			report += `---\n\n`;
+
+			// AI slop aggregates
+			const totalAISlopWarnings = results.reduce((a, b) => {
+				return a + complexityClient.checkThresholds(b).length;
+			}, 0);
+			const totalEmojiComments = results.reduce(
+				(a, b) => a + b.aiCommentPatterns,
+				0,
+			);
+			const totalTryCatch = results.reduce((a, b) => a + b.tryCatchCount, 0);
+			const totalSingleUse = results.reduce(
+				(a, b) => a + b.singleUseFunctions,
+				0,
+			);
+			const maxParams = Math.max(...results.map((r) => r.maxParamsInFunction));
+
+			// Summary
+			report += `## Summary\n\n`;
+			report += `| Metric | Value |\n`;
+			report += `|--------|-------|\n`;
+			report += `| Files Analyzed | ${results.length} |\n`;
+			report += `| Total Functions | ${totalFunctions} |\n`;
+			report += `| Total Lines of Code | ${totalLOC.toLocaleString()} |\n`;
+			report += `| Avg Maintainability Index | ${avgMI.toFixed(1)} |\n`;
+			report += `| Min Maintainability Index | ${minMI.toFixed(1)} |\n`;
+			report += `| Avg Cognitive Complexity | ${avgCognitive.toFixed(1)} |\n`;
+			report += `| Max Cognitive Complexity | ${maxCognitive} |\n`;
+			report += `| Avg Cyclomatic Complexity | ${avgCyclomatic.toFixed(1)} |\n`;
+			report += `| Max Nesting Depth | ${maxNesting} |\n`;
+			report += `| Avg Function Length | ${avgFunctionLength.toFixed(1)} lines |\n\n`;
+
+			// AI Slop Summary
+			report += `## AI Slop Indicators (Aggregate)\n\n`;
+			report += `| Indicator | Count |\n`;
+			report += `|-----------|-------|\n`;
+			report += `| Total Warnings | ${totalAISlopWarnings} |\n`;
+			report += `| Emoji/Boilerplate Comments | ${totalEmojiComments} |\n`;
+			report += `| Try/Catch Blocks | ${totalTryCatch} |\n`;
+			report += `| Single-Use Helper Functions | ${totalSingleUse} |\n`;
+			report += `| Max Function Parameters | ${maxParams} |\n\n`;
+
+			// Grade distribution
+			report += `## Maintainability Grade Distribution\n\n`;
+			report += `| Grade | Count | Percentage |\n`;
+			report += `|-------|-------|------------|\n`;
+			for (const [grade, count] of Object.entries(gradeCount)) {
+				const pct = ((count / results.length) * 100).toFixed(1);
+				const gradeIcons: Record<string, string> = {
+					A: "🟢",
+					B: "🟡",
+					C: "🟠",
+					D: "🔴",
+				};
+				const gradeThresholds: Record<string, number> = {
+					A: 80,
+					B: 60,
+					C: 40,
+					D: 20,
+				};
+				const icon = gradeIcons[grade] ?? "⚫";
+				const threshold = gradeThresholds[grade] ?? 0;
+				report += `| ${icon} ${grade} (MI ≥ ${threshold}) | ${count} | ${pct}% |\n`;
+			}
+			report += `\n`;
+
+			// All files table (sorted by MI ascending)
+			report += `## All Files\n\n`;
+			report += `| Grade | File | MI | Cognitive | LOC | Entropy | Trend |\n`;
+			report += `|-------|------|-----|-----------|-----|---------|-------|\n`;
+
+			const sorted = [...results].sort(
+				(a, b) => a.maintainabilityIndex - b.maintainabilityIndex,
+			);
+			for (const f of sorted) {
+				const mi = f.maintainabilityIndex;
+				let grade: string;
+				if (mi >= 80) grade = "🟢 A";
+				else if (mi >= 60) grade = "🟡 B";
+				else if (mi >= 40) grade = "🟠 C";
+				else if (mi >= 20) grade = "🔴 D";
+				else grade = "⚫ F";
+
+				// Make path relative for readability
+				const relPath = path.relative(targetPath, f.filePath);
+				const trendCell = formatTrendCell(f.filePath, history);
+				const entropyCell = f.codeEntropy > 0 ? f.codeEntropy.toFixed(2) : "—";
+
+				report += `| ${grade} | ${relPath} | ${mi.toFixed(1)} | ${f.cognitiveComplexity} | ${f.linesOfCode} | ${entropyCell} | ${trendCell} |\n`;
+			}
+			report += `\n`;
+
+			// Trend Summary
+			const trendSummary = getTrendSummary(history);
+			report += `## Trend Summary\n\n`;
+			report += `| Trend | Count |\n`;
+			report += `|-------|-------|\n`;
+			report += `| 📈 Improving | ${trendSummary.improving} |\n`;
+			report += `| ➡️ Stable | ${trendSummary.stable} |\n`;
+			report += `| 📉 Regressing | ${trendSummary.regressing} |\n\n`;
+
+			if (trendSummary.worstRegressions.length > 0) {
+				report += `### Top Regressions\n\n`;
+				report += `Files with largest MI decline since last scan:\n\n`;
+				for (const r of trendSummary.worstRegressions) {
+					report += `- **${r.file}**: MI ${r.miDelta > 0 ? "+" : ""}${r.miDelta}\n`;
 				}
+				report += `\n`;
 			}
 
-			if (diagStats.topViolations.length > 0) {
-				lines.push("Top noisy rules:");
-				for (const v of diagStats.topViolations.slice(0, 5)) {
-					const samplePath =
-						v.samplePaths.length > 0
-							? path.relative(runtime.projectRoot, v.samplePaths[0]).replace(/\\/g, "/")
-							: "";
-					const pathSuffix = samplePath ? ` (e.g. ${samplePath})` : "";
-					lines.push(`  ${v.ruleId}: ${v.count}${pathSuffix}`);
+			// Top 10 worst files (actionable)
+			report += `## Top 10 Files Needing Attention\n\n`;
+			report += `These files have the lowest maintainability scores:\n\n`;
+			for (let i = 0; i < Math.min(10, sorted.length); i++) {
+				const f = sorted[i];
+				const relPath = path.relative(targetPath, f.filePath);
+				const warnings: string[] = [];
+
+				if (f.maintainabilityIndex < 20) warnings.push("🔴 Critical: MI < 20");
+				else if (f.maintainabilityIndex < 40) warnings.push("🟠 Low: MI < 40");
+				if (f.cognitiveComplexity > 50)
+					warnings.push(`High cognitive (${f.cognitiveComplexity})`);
+				if (f.maxNestingDepth > 5)
+					warnings.push(`Deep nesting (${f.maxNestingDepth})`);
+				if (f.maxFunctionLength > 50)
+					warnings.push(`Long functions (max ${f.maxFunctionLength})`);
+
+				// AI slop indicators
+				const slopWarnings = complexityClient.checkThresholds(f);
+				for (const w of slopWarnings) {
+					if (
+						w.includes("AI-style") ||
+						w.includes("try/catch") ||
+						w.includes("single-use") ||
+						w.includes("parameter list")
+					) {
+						warnings.push(`🤖 ${w.split(" — ")[0]}`);
+					}
+				}
+
+				report += `${i + 1}. **${relPath}** — MI: ${f.maintainabilityIndex.toFixed(1)}\n`;
+				if (warnings.length > 0) {
+					report += `   - ${warnings.join(", ")}\n`;
 				}
 			}
+			report += `\n`;
 
-			ctx.ui.notify(lines.join("\n"), "info");
+			// Save report
+			nodeFs.mkdirSync(reviewDir, { recursive: true });
+
+			const reportPath = path.join(reviewDir, `metrics-${timestamp}.md`);
+			nodeFs.writeFileSync(reportPath, report, "utf-8");
+
+			// Also save latest.md for easy access
+			const latestPath = path.join(reviewDir, "latest.md");
+			nodeFs.writeFileSync(latestPath, report, "utf-8");
+
+			// Console summary
+			const summary = [
+				`📊 Metrics Report`,
+				`   ${results.length} files, ${totalLOC.toLocaleString()} LOC, ${totalFunctions} functions`,
+				`   MI: ${avgMI.toFixed(1)} avg (${gradeCount.A}A ${gradeCount.B}B ${gradeCount.C}C ${gradeCount.D}D ${gradeCount.F}F)`,
+				`   Cognitive: ${avgCognitive.toFixed(1)} avg, ${maxCognitive} max`,
+				`📄 Saved: ${reportPath}`,
+			].join("\n");
+
+			ctx.ui.notify(summary, "info");
 		},
 	});
 
-	// --- Tools (extracted to tools/) ---
-	pi.registerTool(createAstGrepSearchTool(astGrepClient) as any);
-	pi.registerTool(createAstGrepReplaceTool(astGrepClient) as any);
-	pi.registerTool(createLspNavigationTool((name) => pi.getFlag(name)) as any);
-
-	// REMOVED: ~450 lines of inline tool definitions moved to tools/
-	// See tools/ast-grep-search.ts, tools/ast-grep-replace.ts, tools/lsp-navigation.ts
-
-// Runtime state is managed by RuntimeCoordinator.
-
-// Delta baselines: store pre-write diagnostics to diff against post-write
-const _astGrepBaselines = new Map<
-	string,
-	import("./clients/ast-grep-types.js").AstGrepDiagnostic[]
->();
-const _biomeBaselines = new Map<
-	string,
-	import("./clients/biome-client.js").BiomeDiagnostic[]
->();
-
-// Project rules scan result and per-turn state live in RuntimeCoordinator.
-
-// --- Register skills with pi ---
-pi.on("resources_discover", async (_event, _ctx) => {
-	// Get the extension directory (where this file is located)
-	const extensionDir = path.dirname(fileURLToPath(import.meta.url));
-	const skillsDir = path.join(extensionDir, "skills");
-
-	return {
-		skillPaths: [skillsDir],
-	};
-});
-
-// --- Events ---
-
-pi.on("session_start", async (event, ctx) => {
-	try {
-		_verbose = !!pi.getFlag("lens-verbose");
-		dbg("session_start fired");
-		updateRuntimeIdentityFromEvent(event);
-
-		await handleSessionStart({
-			ctxCwd: ctx.cwd,
-			getFlag: (name: string) => pi.getFlag(name),
-			notify: (msg, level) => ctx.ui.notify(msg, level),
-			dbg,
-			log,
-			runtime,
-			metricsClient,
-			cacheManager,
-			todoScanner,
-			astGrepClient,
-			biomeClient,
-			ruffClient,
-			knipClient,
-			jscpdClient,
-			typeCoverageClient,
-			depChecker,
-			architectClient,
-			testRunnerClient,
-			goClient,
-			rustClient,
-			ensureTool,
-			cleanStaleTsBuildInfo,
-			resetDispatchBaselines,
-			resetLSPService,
-		});
-	} catch (sessionErr) {
-		dbg(`session_start crashed: ${sessionErr}`);
-		dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
-	}
-});
-
-pi.on("tool_call", async (event, ctx) => {
-	const toolName = (event as { toolName?: string }).toolName ?? "";
-	if (pi.getFlag("lens-guard") && isGitCommitOrPushAttempt(toolName, event.input)) {
-		const guard = evaluateGitGuard(
-			runtime,
-			cacheManager,
-			ctx.cwd ?? runtime.projectRoot,
-		);
-		if (guard.block) {
-			return {
-				block: true,
-				reason: guard.reason,
-			};
-		}
-	}
-
-	const filePath =
-		isToolCallEventType("write", event) || isToolCallEventType("edit", event)
-			? (event.input as { path: string }).path
-			: undefined;
-
-	if (!filePath) return;
-
-	dbg(
-		`tool_call fired for: ${filePath} (exists: ${nodeFs.existsSync(filePath)})`,
-	);
-	if (!nodeFs.existsSync(filePath)) return;
-
-	// Record complexity baseline for historical tracking (booboo/tdi).
-	// Not shown inline — just captured for delta analysis.
-	if (
-		complexityClient.isSupportedFile(filePath) &&
-		!runtime.complexityBaselines.has(filePath)
-	) {
-		const baseline = complexityClient.analyzeFile(filePath);
-		if (baseline) {
-			runtime.complexityBaselines.set(filePath, baseline);
-			captureSnapshot(filePath, {
-				maintainabilityIndex: baseline.maintainabilityIndex,
-				cognitiveComplexity: baseline.cognitiveComplexity,
-				maxNestingDepth: baseline.maxNestingDepth,
-				linesOfCode: baseline.linesOfCode,
-				maxCyclomatic: baseline.maxCyclomaticComplexity,
-				entropy: baseline.codeEntropy,
-			});
-		}
-	}
-
-	// --- Pre-write duplicate detection ---
-	// Check if new content redefines functions that already exist elsewhere.
-	// Uses cachedExports (populated at session_start via ast-grep scan).
-	const isWriteOrEdit =
-		isToolCallEventType("write", event) || isToolCallEventType("edit", event);
-	if (isWriteOrEdit && runtime.cachedExports.size > 0) {
-		const newContent = isToolCallEventType("write", event)
-			? (event.input as { content?: string }).content
-			: (event.input as { edits?: Array<{ newText?: string }> }).edits
-					?.map((e) => e.newText ?? "")
-					.join("\n");
-		if (newContent) {
-			const INLINE_SIMILARITY_THRESHOLD = 0.9;
-			const INLINE_SIMILARITY_MAX_HINTS = 3;
-			const INLINE_SIMILARITY_MAX_CHARS = 700;
-			const dupeWarnings: string[] = [];
-			const exportRe =
-				/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
-			let m: RegExpExecArray | null;
-			while ((m = exportRe.exec(newContent))) {
-				const name = m[1];
-				const existingFile = runtime.cachedExports.get(name);
-				if (
-					existingFile &&
-					path.resolve(existingFile) !== path.resolve(filePath)
-				) {
-					dupeWarnings.push(
-						`\`${name}\` already exists in ${path.relative(runtime.projectRoot, existingFile)}`,
-					);
-				}
+	pi.registerCommand("lens-format", {
+		description:
+			"Apply Biome formatting to files. Usage: /lens-format [file-path] or /lens-format --all",
+		handler: async (args, ctx) => {
+			if (!biomeClient.isAvailable()) {
+				ctx.ui.notify(
+					"Biome not installed. Run: npm install -D @biomejs/biome",
+					"error",
+				);
+				return;
 			}
-			if (dupeWarnings.length > 0) {
+
+			const arg = args.trim();
+
+			if (!arg || arg === "--all") {
+				ctx.ui.notify("🔍 Formatting all files...", "info");
+
+				let formatted = 0;
+				let skipped = 0;
+
+				const targetPath = ctx.cwd || process.cwd();
+				const isTsProject = nodeFs.existsSync(
+					path.join(targetPath, "tsconfig.json"),
+				);
+				const files = getSourceFiles(targetPath, isTsProject);
+
+				for (const fullPath of files) {
+					if (/\.(ts|tsx|js|jsx|json|css)$/.test(fullPath)) {
+						const result = biomeClient.formatFile(fullPath);
+						if (result.changed) formatted++;
+						else if (result.success) skipped++;
+					}
+				}
+				ctx.ui.notify(
+					`✓ Formatted ${formatted} file(s), ${skipped} already clean`,
+					"info",
+				);
+				return;
+			}
+
+			const filePath = path.resolve(arg);
+			const result = biomeClient.formatFile(filePath);
+
+			if (result.success && result.changed) {
+				ctx.ui.notify(`✓ Formatted ${path.basename(filePath)}`, "info");
+			} else if (result.success) {
+				ctx.ui.notify(`✓ ${path.basename(filePath)} already clean`, "info");
+			} else {
+				ctx.ui.notify(`⚠️ Format failed: ${result.error}`, "error");
+			}
+		},
+	});
+
+	// --- Tools ---
+
+	const LANGUAGES = [
+		"c",
+		"cpp",
+		"csharp",
+		"css",
+		"dart",
+		"elixir",
+		"go",
+		"haskell",
+		"html",
+		"java",
+		"javascript",
+		"json",
+		"kotlin",
+		"lua",
+		"php",
+		"python",
+		"ruby",
+		"rust",
+		"scala",
+		"sql",
+		"swift",
+		"tsx",
+		"typescript",
+		"yaml",
+	] as const;
+
+	// --- Interviewer tool (browser-based interview with diff confirmation) ---
+	buildInterviewer(pi, dbg);
+
+	pi.registerTool({
+		name: "ast_grep_search",
+		label: "AST Search",
+		description:
+			"Search code using AST-aware pattern matching. IMPORTANT: Use specific AST patterns, NOT text search. Examples:\n- Find function: 'function $NAME() { $$$BODY }'\n- Find call: 'fetchMetrics($ARGS)'\n- Find import: 'import { $NAMES } from \"$PATH\"'\n- Generic identifier (broad): 'fetchMetrics'\n\nAlways prefer specific patterns with context over bare identifiers. Use 'paths' to scope to specific files/folders.",
+		promptSnippet: "Use ast_grep_search for AST-aware code search",
+		parameters: Type.Object({
+			pattern: Type.String({
+				description: "AST pattern (use function/class/call context, not text)",
+			}),
+			lang: Type.Union(
+				LANGUAGES.map((l) => Type.Literal(l)),
+				{ description: "Target language" },
+			),
+			paths: Type.Optional(
+				Type.Array(Type.String(), {
+					description: "Specific files/folders to search",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!astGrepClient.isAvailable()) {
 				return {
-					block: true,
-					reason: `🔴 STOP — Redefining existing export(s). Import instead:\n${dupeWarnings.map((w) => `  • ${w}`).join("\n")}`,
+					content: [
+						{
+							type: "text",
+							text: "ast-grep CLI not found. Install: npm i -D @ast-grep/cli",
+						},
+					],
+					isError: true,
+					details: {},
 				};
 			}
 
-			// --- Structural similarity check (Phase 7b) ---
-			// If the project index was built at session_start, check new
-			// functions against it for structural clones (~50ms).
-			if (
-				runtime.cachedProjectIndex &&
-				runtime.cachedProjectIndex.entries.size > 0 &&
-				/\.(ts|tsx)$/.test(filePath)
-			) {
-				try {
-					const ts = await import("typescript");
-					const sourceFile = ts.createSourceFile(
-						filePath,
-						newContent,
-						ts.ScriptTarget.Latest,
-						true,
-					);
-					const newFunctions = extractFunctions(sourceFile, newContent);
-					const simWarnings: string[] = [];
-					let simHintsTruncated = false;
-					const relPath = path.relative(runtime.projectRoot, filePath);
+			const { pattern, lang, paths } = params as {
+				pattern: string;
+				lang: string;
+				paths?: string[];
+			};
+			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+			const result = await astGrepClient.search(pattern, lang, searchPaths);
 
-					for (const func of newFunctions) {
-						if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-							simHintsTruncated = true;
-							break;
-						}
-						if (func.transitionCount < 20) continue;
-						const matches = findSimilarFunctions(
-							func.matrix,
-							runtime.cachedProjectIndex,
-							INLINE_SIMILARITY_THRESHOLD,
-							1,
-						);
-						for (const match of matches) {
-							if (simWarnings.length >= INLINE_SIMILARITY_MAX_HINTS) {
-								simHintsTruncated = true;
-								break;
-							}
-							const targetPathMatch = String(match.targetLocation).match(
-								/^(.*):\d+$/,
-							);
-							const targetPath = targetPathMatch?.[1] ?? String(match.targetLocation);
-							const resolvedTarget = path.isAbsolute(targetPath)
-								? targetPath
-								: path.join(runtime.projectRoot, targetPath);
-							if (!nodeFs.existsSync(resolvedTarget)) continue;
+			if (result.error) {
+				return {
+					content: [{ type: "text", text: `Error: ${result.error}` }],
+					isError: true,
+					details: {},
+				};
+			}
 
-							// Skip self-matches
-							if (match.targetId === `${relPath}:${func.name}`) continue;
-							const pct = Math.round(match.similarity * 100);
-							simWarnings.push(
-								`\`${func.name}\` is ${pct}% similar to \`${match.targetName}\` at \`${String(match.targetLocation).replace(/\\/g, "/")}\``,
-							);
-						}
-					}
+			const output = astGrepClient.formatMatches(result.matches);
+			return {
+				content: [{ type: "text", text: output }],
+				details: { matchCount: result.matches.length },
+			};
+		},
+	});
 
-					if (simWarnings.length > 0) {
-						let reason = `⚠️ Potential structural similarity (advisory):\n${simWarnings.map((w) => `  • ${w}`).join("\n")}`;
-						if (simHintsTruncated) {
-							reason += "\n  • ... additional similar candidates omitted";
-						}
-						reason += "\nUse this only as a hint; verify behavior before refactoring.";
-						if (reason.length > INLINE_SIMILARITY_MAX_CHARS) {
-							reason = `${reason.slice(0, INLINE_SIMILARITY_MAX_CHARS)}\n... (truncated)`;
-						}
-						return {
-							block: false,
-							reason,
-						};
-					}
-				} catch {
-					// Parsing failed — skip similarity check silently
+	pi.registerTool({
+		name: "ast_grep_replace",
+		label: "AST Replace",
+		description:
+			"Replace code using AST-aware pattern matching. IMPORTANT: Use specific AST patterns, not text. Dry-run by default (use apply=true to apply).\n\nExamples:\n- pattern='console.log($MSG)' rewrite='logger.info($MSG)'\n- pattern='var $X' rewrite='let $X'\n- pattern='function $NAME() { }' rewrite='' (delete)\n\nAlways use 'paths' to scope to specific files/folders. Dry-run first to preview changes.",
+		promptSnippet: "Use ast_grep_replace for AST-aware find-and-replace",
+		parameters: Type.Object({
+			pattern: Type.String({
+				description: "AST pattern to match (be specific with context)",
+			}),
+			rewrite: Type.String({
+				description: "Replacement using meta-variables from pattern",
+			}),
+			lang: Type.Union(
+				LANGUAGES.map((l) => Type.Literal(l)),
+				{ description: "Target language" },
+			),
+			paths: Type.Optional(
+				Type.Array(Type.String(), { description: "Specific files/folders" }),
+			),
+			apply: Type.Optional(
+				Type.Boolean({ description: "Apply changes (default: false)" }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!astGrepClient.isAvailable()) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "ast-grep CLI not found. Install: npm i -D @ast-grep/cli",
+						},
+					],
+					isError: true,
+					details: {},
+				};
+			}
+
+			const { pattern, rewrite, lang, paths, apply } = params as {
+				pattern: string;
+				rewrite: string;
+				lang: string;
+				paths?: string[];
+				apply?: boolean;
+			};
+			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+			const result = await astGrepClient.replace(
+				pattern,
+				rewrite,
+				lang,
+				searchPaths,
+				apply ?? false,
+			);
+
+			if (result.error) {
+				return {
+					content: [{ type: "text", text: `Error: ${result.error}` }],
+					isError: true,
+					details: {},
+				};
+			}
+
+			const isDryRun = !apply;
+			let output = astGrepClient.formatMatches(result.matches, isDryRun);
+			if (isDryRun && result.matches.length > 0)
+				output += "\n\n(Dry run - use apply=true to apply)";
+			if (apply && result.matches.length > 0)
+				output = `Applied ${result.matches.length} replacements:\n${output}`;
+
+			return {
+				content: [{ type: "text", text: output }],
+				details: { matchCount: result.matches.length, applied: apply ?? false },
+			};
+		},
+	});
+
+	let _cachedJscpdClones: import("./clients/jscpd-client.js").DuplicateClone[] =
+		[];
+	const cachedExports = new Map<string, string>(); // function name -> file path
+	const complexityBaselines: Map<
+		string,
+		import("./clients/complexity-client.js").FileComplexity
+	> = new Map();
+
+	// Delta baselines: store pre-write diagnostics to diff against post-write
+	const astGrepBaselines = new Map<
+		string,
+		import("./clients/ast-grep-client.js").AstGrepDiagnostic[]
+	>();
+	const biomeBaselines = new Map<
+		string,
+		import("./clients/biome-client.js").BiomeDiagnostic[]
+	>();
+
+	// Project rules scan result (from .claude/rules, .agents/rules, etc.)
+	let projectRulesScan: RuleScanResult = { rules: [], hasCustomRules: false };
+
+	// --- Events ---
+
+	pi.on("session_start", async (_event, ctx) => {
+		_verbose = !!pi.getFlag("lens-verbose");
+		dbg("session_start fired");
+
+		// Reset session state
+		metricsClient.reset();
+		complexityBaselines.clear();
+
+		const cwd = ctx.cwd ?? process.cwd();
+		projectRoot = cwd; // Module-level for architect client
+		dbg(`session_start cwd: ${cwd}`);
+
+		// Keep startup lightweight: avoid eager availability probes and full-project scans.
+		// Project rules and heavyweight review scans are handled on-demand by commands.
+		architectClient.loadConfig(cwd);
+		projectRulesScan = { rules: [], hasCustomRules: false };
+		cachedExports.clear();
+
+		const parts: string[] = [];
+		dbg("session_start: deferred tool probes and codebase scans until needed");
+
+		// --- Error debt: check if tests ran since last session ---
+		// If files were modified in previous turn, run tests and check for regression
+		const errorDebtEnabled = pi.getFlag("error-debt");
+		const detectedRunner = errorDebtEnabled
+			? testRunnerClient.detectRunner(cwd)
+			: null;
+		const pendingDebt = cacheManager.readCache<{
+			pendingCheck: boolean;
+			baselineTestsPassed: boolean;
+		}>("errorDebt", cwd);
+
+		if (errorDebtEnabled && detectedRunner && pendingDebt?.data?.pendingCheck) {
+			dbg("session_start: running pending error debt check");
+			const testResult = testRunnerClient.runTestFile(
+				".",
+				cwd,
+				detectedRunner.runner,
+				detectedRunner.config,
+			);
+			const testsPassed = testResult.failed === 0 && !testResult.error;
+			const baselinePassed = pendingDebt.data.baselineTestsPassed;
+
+			// Regression detected!
+			if (baselinePassed && !testsPassed) {
+				const msg = `🔴 ERROR DEBT: Tests were passing but now failing (${testResult.failed} failure(s)). Fix before continuing.`;
+				dbg(`session_start ERROR DEBT: ${msg}`);
+				parts.push(msg);
+			}
+
+			// Update baseline
+			errorDebtBaseline = {
+				testsPassed: testsPassed,
+				buildPassed: true,
+			};
+		} else if (errorDebtEnabled && detectedRunner) {
+			// No pending check - establish fresh baseline
+			dbg("session_start: establishing fresh error debt baseline");
+			const testResult = testRunnerClient.runTestFile(
+				".",
+				cwd,
+				detectedRunner.runner,
+				detectedRunner.config,
+			);
+			const testsPassed = testResult.failed === 0 && !testResult.error;
+			errorDebtBaseline = {
+				testsPassed: testsPassed,
+				buildPassed: true,
+			};
+			dbg(
+				`session_start error debt baseline: testsPassed=${errorDebtBaseline.testsPassed}`,
+			);
+		}
+	});
+
+	// --- Pre-write proactive hints ---
+	// Stored during tool_call, prepended to tool_result output so the agent sees them.
+	const preWriteHints = new Map<string, string>();
+
+	pi.on("tool_call", async (event, _ctx) => {
+		const filePath =
+			isToolCallEventType("write", event) || isToolCallEventType("edit", event)
+				? (event.input as { path: string }).path
+				: undefined;
+
+		if (!filePath) return;
+
+		dbg(
+			`tool_call fired for: ${filePath} (exists: ${nodeFs.existsSync(filePath)})`,
+		);
+		if (!nodeFs.existsSync(filePath)) return;
+
+		// Record complexity baseline for TS/JS files + capture history snapshot
+		if (
+			complexityClient.isSupportedFile(filePath) &&
+			!complexityBaselines.has(filePath)
+		) {
+			const baseline = complexityClient.analyzeFile(filePath);
+			if (baseline) {
+				complexityBaselines.set(filePath, baseline);
+				// Capture snapshot for historical tracking (async, non-blocking)
+				captureSnapshot(filePath, {
+					maintainabilityIndex: baseline.maintainabilityIndex,
+					cognitiveComplexity: baseline.cognitiveComplexity,
+					maxNestingDepth: baseline.maxNestingDepth,
+					linesOfCode: baseline.linesOfCode,
+				});
+			}
+		}
+
+		const hints: string[] = [];
+
+		if (/\.(ts|tsx|js|jsx)$/.test(filePath) && !pi.getFlag("no-lsp")) {
+			tsClient.updateFile(filePath, nodeFs.readFileSync(filePath, "utf-8"));
+			const diags = tsClient.getDiagnostics(filePath);
+			if (diags.length > 0) {
+				hints.push(
+					`⚠ Pre-write: file already has ${diags.length} TypeScript error(s) — fix before adding more`,
+				);
+			}
+		}
+
+		// Snapshot baselines for delta mode (no pre-write hints — delta handles it)
+		if (!pi.getFlag("no-ast-grep") && astGrepClient.isAvailable()) {
+			const baselineDiags = astGrepClient.scanFile(filePath);
+			astGrepBaselines.set(filePath, baselineDiags);
+
+			// Add to TDR baseline
+			const initialTdr = baselineDiags
+				.filter((d) => d.ruleDescription?.grade !== undefined)
+				.reduce((acc, d) => acc + (d.ruleDescription?.grade ?? 0), 0);
+
+			metricsClient.recordBaseline(filePath, initialTdr);
+		} else {
+			metricsClient.recordBaseline(filePath);
+		}
+
+		if (
+			!pi.getFlag("no-biome") &&
+			biomeClient.isAvailable() &&
+			biomeClient.isSupportedFile(filePath)
+		) {
+			biomeBaselines.set(
+				filePath,
+				biomeClient
+					.checkFile(filePath)
+					.filter((d) => d.category === "lint" || d.severity === "error"),
+			);
+		}
+
+		// Architectural rules pre-write hints
+		if (architectClient.hasConfig()) {
+			const relPath = path.relative(projectRoot, filePath).replace(/\\/g, "/");
+			const archHints = architectClient.getHints(relPath);
+			if (archHints.length > 0) {
+				hints.push(`📐 Architectural rules for ${relPath}:`);
+				for (const h of archHints) {
+					hints.push(`  → ${h}`);
 				}
 			}
 		}
-	}
-});
 
-// Real-time feedback on file writes/edits
-// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
-(pi as any).on("tool_result", async (event: any) => {
-	updateRuntimeIdentityFromEvent(event);
-	return handleToolResult({
-		event: event as any,
-		getFlag: (name: string) => pi.getFlag(name),
-		dbg,
-		runtime,
-		cacheManager,
-		biomeClient,
-		ruffClient,
-		testRunnerClient,
-		metricsClient,
-		resetLSPService,
-		agentBehaviorRecord: (toolName, filePath) =>
-			agentBehaviorClient.recordToolCall(toolName, filePath),
-		formatBehaviorWarnings: (warnings) =>
-			agentBehaviorClient.formatWarnings(warnings as any),
+		dbg(`  pre-write hints: ${hints.length} — ${hints.join(" | ") || "none"}`);
+		if (hints.length > 0) {
+			preWriteHints.set(filePath, hints.join("\n"));
+		}
 	});
-});
-// --- Inject project rules into system prompt ---
-pi.on("before_agent_start", async (event) => {
-	updateRuntimeIdentityFromEvent(event);
-	if (!runtime.projectRulesScan.hasCustomRules) return;
 
-	const rulesSection = formatRulesForPrompt(runtime.projectRulesScan);
-	return {
-		systemPrompt: `${event.systemPrompt}\n\n## Project Rules\nRead these files only when relevant:\n${rulesSection}\n`,
-	};
-});
+	// Real-time feedback on file writes/edits
+	pi.on("tool_result", async (event) => {
+		// Track tool call for behavior analysis (all tool types)
+		const filePath = (event.input as { path?: string }).path;
+		const behaviorWarnings = agentBehaviorClient.recordToolCall(
+			event.toolName,
+			filePath,
+		);
 
-// --- Turn end: batch jscpd/madge on collected files, then clear state ---
-// Clear cascade snapshot at start of each new turn so stale data never leaks
-pi.on("turn_start", () => {
-	runtime.beginTurn();
-});
+		if (event.toolName !== "write" && event.toolName !== "edit") {
+			dbg(
+				`tool_result: skipped turn tracking - toolName="${event.toolName}" (not write/edit)`,
+			);
+			return;
+		}
+		if (!filePath) {
+			dbg(
+				`tool_result: skipped turn tracking - no filePath for toolName="${event.toolName}"`,
+			);
+			return;
+		}
+		dbg(
+			`tool_result: tracking turn state for ${event.toolName} on ${filePath}`,
+		);
 
-pi.on("turn_end", async (_event, ctx) => {
-	try {
-		await handleTurnEnd({
-			ctxCwd: ctx.cwd,
-			getFlag: (name: string) => pi.getFlag(name),
-			dbg,
-			runtime,
-			cacheManager,
-			jscpdClient,
-			knipClient,
-			depChecker,
-			resetLSPService,
-			resetFormatService,
-		});
-	} catch (turnEndErr) {
-		dbg(`turn_end crashed: ${turnEndErr}`);
-		dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
-	}
-});
+		// --- Track modified ranges in turn state for async jscpd/madge at turn_end ---
+		const cwd = projectRoot;
+		try {
+			const details = event.details as { diff?: string } | undefined;
+			dbg(
+				`tool_result: details.diff=${details?.diff ? "present" : "missing"}, details keys: ${Object.keys(event.details || {}).join(", ")}`,
+			);
+			if (event.toolName === "edit" && details?.diff) {
+				const diff = details.diff;
+				dbg(
+					`tool_result: diff content (first 500 chars): ${diff.substring(0, 500)}`,
+				);
+				const ranges = parseDiffRanges(diff);
+				const importsChanged =
+					/import\s/.test(diff) || /from\s+['"]/.test(diff);
+				dbg(
+					`tool_result: parsed ${ranges.length} ranges, importsChanged=${importsChanged}`,
+				);
+				for (const range of ranges) {
+					dbg(
+						`tool_result: adding range ${range.start}-${range.end} for ${filePath}`,
+					);
+					cacheManager.addModifiedRange(filePath, range, importsChanged, cwd);
+				}
+				dbg(
+					`tool_result: turn state after add: ${JSON.stringify(cacheManager.readTurnState(cwd))}`,
+				);
+			} else if (event.toolName === "write" && nodeFs.existsSync(filePath)) {
+				const content = nodeFs.readFileSync(filePath, "utf-8");
+				const lineCount = content.split("\n").length;
+				const hasImports = /^import\s/m.test(content);
+				cacheManager.addModifiedRange(
+					filePath,
+					{ start: 1, end: lineCount },
+					hasImports,
+					cwd,
+				);
+			}
+		} catch (err) {
+			dbg(`turn state tracking error: ${err}`);
+			dbg(`turn state tracking error stack: ${(err as Error).stack}`);
+		}
 
-// --- Inject turn-end findings into next agent turn ---
-// jscpd, madge, and turn-end delta results are cached at turn_end and consumed here
-// via the context event, which fires before each provider request.
-// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
-(pi as any).on("context", async (_event: unknown, ctx: { cwd?: string }) => {
-	try {
+		dbg(`tool_result fired for: ${filePath}`);
+		dbg(`  cwd: ${process.cwd()}`);
+		dbg(
+			`  __dirname: ${typeof __dirname !== "undefined" ? __dirname : "undefined"}`,
+		);
+
+		// Prepend any pre-write hints collected during tool_call
+		const preHint = preWriteHints.get(filePath);
+		preWriteHints.delete(filePath);
+
+		// Record write for metrics (silent tracking)
+
+		try {
+			const content = nodeFs.readFileSync(filePath, "utf-8");
+			metricsClient.recordWrite(filePath, content);
+		} catch (err) {
+			void err;
+		}
+
+		let lspOutput = preHint ? `\n\n${preHint}` : "";
+
+		// --- Declarative dispatch: run all applicable lint tools ---
+		// Phase 2: Replaced ~400 lines of if/else with unified dispatch system
+		dbg(`dispatch: running lint tools for ${filePath}`);
+		const dispatchOutput = await dispatchLint(filePath, projectRoot, pi);
+		if (dispatchOutput) {
+			lspOutput += `\n\n${dispatchOutput}`;
+		}
+
+		// Agent behavior warnings (blind writes, thrashing)
+		if (behaviorWarnings.length > 0) {
+			lspOutput += `\n\n${agentBehaviorClient.formatWarnings(behaviorWarnings)}`;
+		}
+
+		if (!lspOutput) return;
+
+		return {
+			content: [...event.content, { type: "text" as const, text: lspOutput }],
+		};
+	});
+
+	// --- Inject project rules into system prompt ---
+	pi.on("before_agent_start", async (event) => {
+		if (!projectRulesScan.hasCustomRules) return;
+
+		const rulesSection = formatRulesForPrompt(projectRulesScan);
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n## Project Rules (from project files)\n\nThe following project-specific rule files exist. Read them with the \`read\` tool when relevant:\n\n${rulesSection}\n`,
+		};
+	});
+
+	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
+	pi.on("turn_end", async (_event, ctx) => {
 		const cwd = ctx.cwd ?? process.cwd();
-		return consumeTurnEndFindings(cacheManager, cwd);
-	} catch (err) {
-		dbg(`context event error: ${err}`);
-	}
-});
+		const turnState = cacheManager.readTurnState(cwd);
+		const files = Object.keys(turnState.files);
+
+		if (files.length === 0) return;
+
+		dbg(
+			`turn_end: ${files.length} file(s) modified, cycles: ${turnState.turnCycles}/${turnState.maxCycles}`,
+		);
+
+		// Max cycles guard — force through after N turns with unresolved issues
+		if (cacheManager.isMaxCyclesExceeded(cwd)) {
+			dbg("turn_end: max cycles exceeded, clearing state and forcing through");
+			cacheManager.clearTurnState(cwd);
+			return;
+		}
+
+		const parts: string[] = [];
+
+		// jscpd: scan modified files, filter results to modified line ranges
+		if (jscpdClient.isAvailable()) {
+			const jscpdFiles = cacheManager.getFilesForJscpd(cwd);
+			if (jscpdFiles.length > 0) {
+				dbg(`turn_end: jscpd scanning ${jscpdFiles.length} file(s)`);
+				// Use full scan then filter — jscpd doesn't support per-file scanning
+				const result = jscpdClient.scan(cwd);
+				// Filter clones to only those intersecting modified ranges
+				const jscpdFileSet = new Set(
+					jscpdFiles.map((f) => path.resolve(cwd, f)),
+				);
+				const filtered = result.clones.filter((clone) => {
+					const resolvedA = path.resolve(clone.fileA);
+					if (!jscpdFileSet.has(resolvedA)) return false;
+					const relA = path.relative(cwd, resolvedA).replace(/\\/g, "/");
+					const state = turnState.files[relA];
+					if (!state) return false;
+					return cacheManager.isLineInModifiedRange(
+						clone.startA,
+						state.modifiedRanges,
+					);
+				});
+				if (filtered.length > 0) {
+					let report = `🔴 New duplicates in modified code:\n`;
+					for (const clone of filtered.slice(0, 5)) {
+						report += `  ${path.basename(clone.fileA)}:${clone.startA} ↔ ${path.basename(clone.fileB)}:${clone.startB} (${clone.lines} lines)\n`;
+					}
+					parts.push(report);
+				}
+				// Update the global cache with fresh results
+				_cachedJscpdClones = result.clones;
+				cacheManager.writeCache("jscpd", result, cwd);
+			}
+		}
+
+		// madge: only check files where imports changed
+		if (depChecker.isAvailable()) {
+			const madgeFiles = cacheManager.getFilesForMadge(cwd);
+			if (madgeFiles.length > 0) {
+				dbg(
+					`turn_end: madge checking ${madgeFiles.length} file(s) for circular deps`,
+				);
+				for (const file of madgeFiles) {
+					const absPath = path.resolve(cwd, file);
+					const depResult = depChecker.checkFile(absPath);
+					if (depResult.hasCircular && depResult.circular.length > 0) {
+						const circularDeps = depResult.circular
+							.flatMap((d) => d.path)
+							.filter((p: string) => !absPath.endsWith(path.basename(p)));
+						const uniqueDeps = [...new Set(circularDeps)];
+						if (uniqueDeps.length > 0) {
+							parts.push(
+								`🟡 Circular dependency in ${file}: imports ${uniqueDeps.join(", ")}`,
+							);
+						}
+					}
+				}
+			}
+		}
+
+		// Increment turn cycle and persist
+		cacheManager.incrementTurnCycle(cwd);
+
+		if (parts.length > 0) {
+			dbg(`turn_end: ${parts.length} issue(s) found`);
+			// Issues found — state persists so next turn re-checks.
+			// After maxCycles, clearTurnState forces through.
+		} else {
+			// No issues — clear state for next batch of edits
+			cacheManager.clearTurnState(cwd);
+		}
+
+		// --- Error debt: trigger background test run for next session ---
+		// We don't wait - just set a flag that tests should run at next session_start
+		// This way tests run async (session_start is when agent is idle)
+		if (errorDebtBaseline && files.length > 0) {
+			dbg("turn_end: marking error debt check for next session");
+			// Write a marker file - next session_start will pick this up
+			cacheManager.writeCache(
+				"errorDebt",
+				{
+					pendingCheck: true,
+					baselineTestsPassed: errorDebtBaseline.testsPassed,
+				},
+				cwd,
+			);
+		}
+	});
 }

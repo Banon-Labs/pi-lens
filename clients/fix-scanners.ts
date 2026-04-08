@@ -14,14 +14,8 @@ import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { BiomeClient } from "./biome-client.js";
 import type { ComplexityClient } from "./complexity-client.js";
-import {
-	getSgCommand,
-	isSgAvailable,
-} from "./dispatch/runners/utils/runner-helpers.js";
-import { isExcludedDirName } from "./file-utils.js";
 import type { JscpdClient } from "./jscpd-client.js";
 import type { KnipClient } from "./knip-client.js";
-import { safeSpawn } from "./safe-spawn.js";
 import { shouldIgnoreFile } from "./scan-utils.js";
 
 export interface DuplicateClone {
@@ -74,9 +68,8 @@ function dbg(msg: string) {
 	const line = `[${new Date().toISOString()}] ${msg}\n`;
 	try {
 		nodeFs.appendFileSync(DEBUG_LOG, line);
-	} catch (err) {
-		// Debug logging failed, silently ignore to avoid recursive errors
-		void err;
+	} catch {
+		// Ignored
 	}
 }
 
@@ -123,13 +116,19 @@ export function scanAstGrep(
 	isTsProject: boolean,
 	configPath: string,
 ): AstIssue[] {
-	if (!isSgAvailable()) return [];
+	const hasSg =
+		nodeFs.existsSync(path.join(targetPath, "node_modules", ".bin", "sg")) ||
+		childProcess.spawnSync("npx", ["sg", "--version"], {
+			encoding: "utf-8",
+			timeout: 5000,
+			shell: true,
+		}).status === 0;
 
-	const { cmd: sgCmd, args: sgPre } = getSgCommand();
-	const result = safeSpawn(
-		sgCmd,
+	if (!hasSg) return [];
+
+	const result = childProcess.spawnSync(
+		"npx",
 		[
-			...sgPre,
 			"sg",
 			"scan",
 			"--config",
@@ -147,7 +146,10 @@ export function scanAstGrep(
 			targetPath,
 		],
 		{
+			encoding: "utf-8",
 			timeout: 30000,
+			shell: true,
+			maxBuffer: 32 * 1024 * 1024,
 		},
 	);
 
@@ -200,7 +202,7 @@ export function scanBiomeIssues(
 ): BiomeIssue[] {
 	if (!biome.isAvailable()) return [];
 
-	const checkResult = safeSpawn(
+	const checkResult = childProcess.spawnSync(
 		"npx",
 		[
 			"@biomejs/biome",
@@ -209,7 +211,7 @@ export function scanBiomeIssues(
 			"--max-diagnostics=50",
 			targetPath,
 		],
-		{ timeout: 20000 },
+		{ encoding: "utf-8", timeout: 20000, shell: true },
 	);
 
 	const remainingBiome: BiomeIssue[] = [];
@@ -249,7 +251,17 @@ export function scanSlop(
 		for (const entry of nodeFs.readdirSync(dir, { withFileTypes: true })) {
 			const fullPath = path.join(dir, entry.name);
 			if (entry.isDirectory()) {
-				if (isExcludedDirName(entry.name)) continue;
+				if (
+					[
+						"node_modules",
+						".git",
+						"dist",
+						"build",
+						".next",
+						".pi-lens",
+					].includes(entry.name)
+				)
+					continue;
 				scanDir(fullPath);
 			} else if (complexity.isSupportedFile(fullPath)) {
 				const metrics = complexity.analyzeFile(fullPath);

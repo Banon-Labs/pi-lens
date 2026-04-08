@@ -10,9 +10,9 @@
  * specific file being edited, not the entire suite.
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -111,6 +111,7 @@ const RUNNERS: Record<string, RunnerConfig> = {
 			"vitest.config.ts",
 			"vitest.config.js",
 			"vitest.config.mjs",
+			"vite.config.ts",
 		],
 		command: "npx",
 		args: (testFile, _cwd) => [
@@ -170,7 +171,7 @@ const RUNNERS: Record<string, RunnerConfig> = {
 	},
 	gradle: {
 		configFiles: ["build.gradle", "build.gradle.kts", "settings.gradle"],
-		command: process.platform === "win32" ? "gradlew.bat" : "./gradlew",
+		command: "./gradlew",
 		args: (_testFile, _cwd) => ["test", "--no-daemon"],
 		parseJson: false,
 	},
@@ -199,7 +200,6 @@ const RUNNERS: Record<string, RunnerConfig> = {
 export class TestRunnerClient {
 	private log: (msg: string) => void;
 	private availableRunners: Map<string, boolean> = new Map();
-	private failedTestsByRunner: Map<string, Set<string>> = new Map();
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -214,10 +214,7 @@ export class TestRunnerClient {
 	 * 2. package.json dependencies
 	 * 3. node_modules presence
 	 */
-	detectRunner(
-		cwd: string,
-		sourceFilePath?: string,
-	): { runner: string; config: RunnerConfig } | null {
+	detectRunner(cwd: string): { runner: string; config: RunnerConfig } | null {
 		// Priority 1: Config files
 		for (const [name, config] of Object.entries(RUNNERS)) {
 			const cacheKey = `${cwd}:${name}:config`;
@@ -228,19 +225,9 @@ export class TestRunnerClient {
 				continue;
 			}
 
-			const found = config.configFiles.some((cf) => {
-				if (name === "pytest" && cf === "pyproject.toml") {
-					const pyprojectPath = path.join(cwd, cf);
-					if (!fs.existsSync(pyprojectPath)) return false;
-					try {
-						const pyproject = fs.readFileSync(pyprojectPath, "utf-8");
-						return pyproject.includes("[tool.pytest.ini_options]");
-					} catch {
-						return false;
-					}
-				}
-				return fs.existsSync(path.join(cwd, cf));
-			});
+			const found = config.configFiles.some((cf) =>
+				fs.existsSync(path.join(cwd, cf)),
+			);
 
 			this.availableRunners.set(cacheKey, found);
 			if (found) {
@@ -313,15 +300,13 @@ export class TestRunnerClient {
 			}
 		}
 
-		// Priority 5: Check if pytest is available globally (Python files only)
-		const isPythonSource =
-			typeof sourceFilePath === "string" && sourceFilePath.endsWith(".py");
-		if (!isPythonSource) return null;
-
+		// Priority 5: Check if pytest is available globally (for Python)
 		try {
 			const whichCmd = process.platform === "win32" ? "where" : "which";
-			const result = safeSpawn(whichCmd, ["pytest"], {
+			const result = spawnSync(whichCmd, ["pytest"], {
+				encoding: "utf-8",
 				timeout: 2000,
+				shell: true,
 			});
 			if (result.status === 0) {
 				this.log("Detected pytest globally");
@@ -341,7 +326,6 @@ export class TestRunnerClient {
 	findTestFile(
 		sourceFilePath: string,
 		cwd: string,
-		runnerOverride?: string,
 	): { testFile: string; runner: string } | null {
 		const ext = path.extname(sourceFilePath);
 		const basename = path.basename(sourceFilePath, ext);
@@ -351,9 +335,7 @@ export class TestRunnerClient {
 		const patterns = SOURCE_TO_TEST_PATTERNS.find((p) => p.ext === ext);
 		if (!patterns) return null;
 
-		const detected = runnerOverride
-			? { runner: runnerOverride, config: RUNNERS[runnerOverride] }
-			: this.detectRunner(cwd, sourceFilePath);
+		const detected = this.detectRunner(cwd);
 		if (!detected) return null;
 
 		// Check each potential test file location
@@ -409,60 +391,6 @@ export class TestRunnerClient {
 	}
 
 	/**
-	 * Select the most useful test target for this edit.
-	 *
-	 * Strategy:
-	 * 1) If there are known failing tests, rerun those first (fast feedback loop).
-	 * 2) Otherwise run related tests for the edited file.
-	 */
-	getTestRunTarget(
-		sourceFilePath: string,
-		cwd: string,
-	): {
-		testFile: string;
-		runner: string;
-		config: RunnerConfig;
-		strategy: "failed-first" | "related";
-	} | null {
-		const detected = this.detectRunner(cwd, sourceFilePath);
-		if (!detected) return null;
-
-		const key = this.failedKey(cwd, detected.runner);
-		const failedSet = this.failedTestsByRunner.get(key);
-		const related = this.findTestFile(sourceFilePath, cwd, detected.runner);
-
-		if (failedSet && failedSet.size > 0) {
-			if (related) {
-				const relatedAbs = path.resolve(related.testFile);
-				if (failedSet.has(relatedAbs)) {
-					return {
-						testFile: relatedAbs,
-						runner: detected.runner,
-						config: detected.config,
-						strategy: "failed-first",
-					};
-				}
-			}
-
-			return {
-				testFile: [...failedSet][0],
-				runner: detected.runner,
-				config: detected.config,
-				strategy: "failed-first",
-			};
-		}
-
-		if (!related) return null;
-
-		return {
-			testFile: path.resolve(related.testFile),
-			runner: detected.runner,
-			config: detected.config,
-			strategy: "related",
-		};
-	}
-
-	/**
 	 * Run tests for a specific file
 	 */
 	runTestFile(
@@ -485,9 +413,11 @@ export class TestRunnerClient {
 			const args = config.args(absoluteTestFile, cwd);
 			this.log(`Running: ${config.command} ${args.join(" ")}`);
 
-			const result = safeSpawn(config.command, args, {
+			const result = spawnSync(config.command, args, {
+				encoding: "utf-8",
 				cwd,
 				timeout: 60000, // 60s timeout
+				shell: true,
 			});
 
 			const stdout = result.stdout || "";
@@ -504,29 +434,26 @@ export class TestRunnerClient {
 				);
 			}
 
-			let parsed: TestResult;
 			// Parse output based on runner
 			switch (runner) {
 				case "vitest":
-					parsed = this.parseVitestOutput(
+					return this.parseVitestOutput(
 						stdout,
 						stderr,
 						absoluteTestFile,
 						cwd,
 						runner,
 					);
-					break;
 				case "jest":
-					parsed = this.parseJestOutput(
+					return this.parseJestOutput(
 						stdout,
 						stderr,
 						absoluteTestFile,
 						cwd,
 						runner,
 					);
-					break;
 				case "pytest":
-					parsed = this.parsePytestOutput(
+					return this.parsePytestOutput(
 						stdout,
 						stderr,
 						result.status ?? 0,
@@ -534,114 +461,14 @@ export class TestRunnerClient {
 						cwd,
 						runner,
 					);
-					break;
 				default:
-					parsed = this.parseGenericRunnerOutput(
-						stdout,
-						stderr,
-						result.status ?? 0,
+					return this.emptyResult(
 						absoluteTestFile,
+						"",
 						runner,
+						"Unknown runner",
 					);
-					break;
 			}
-
-			this.recordResult(cwd, runner, absoluteTestFile, parsed);
-			return parsed;
-		} catch (err: any) {
-			this.log(`Run error: ${err.message}`);
-			return this.emptyResult(absoluteTestFile, "", runner, err.message);
-		}
-	}
-
-	/**
-	 * Async version of runTestFile — does NOT block the event loop.
-	 *
-	 * Use this in the per-write pipeline (pipeline.ts) so that LSP messages,
-	 * other file writes, and all async operations continue while tests run.
-	 * The sync runTestFile is kept for session_start where blocking is acceptable.
-	 */
-	async runTestFileAsync(
-		testFile: string,
-		cwd: string,
-		runner: string,
-		config: RunnerConfig,
-	): Promise<TestResult> {
-		const absoluteTestFile = path.resolve(testFile);
-		if (!fs.existsSync(absoluteTestFile)) {
-			return this.emptyResult(
-				absoluteTestFile,
-				"",
-				runner,
-				"Test file not found",
-			);
-		}
-
-		try {
-			const args = config.args(absoluteTestFile, cwd);
-			this.log(`Running (async): ${config.command} ${args.join(" ")}`);
-
-			const result = await safeSpawnAsync(config.command, args, {
-				cwd,
-				timeout: 60000,
-			});
-
-			const stdout = result.stdout || "";
-			const stderr = result.stderr || "";
-
-			if (result.error) {
-				this.log(`Runner error: ${result.error.message}`);
-				return this.emptyResult(
-					absoluteTestFile,
-					"",
-					runner,
-					`Runner error: ${result.error.message}`,
-				);
-			}
-
-			let parsed: TestResult;
-			switch (runner) {
-				case "vitest":
-					parsed = this.parseVitestOutput(
-						stdout,
-						stderr,
-						absoluteTestFile,
-						cwd,
-						runner,
-					);
-					break;
-				case "jest":
-					parsed = this.parseJestOutput(
-						stdout,
-						stderr,
-						absoluteTestFile,
-						cwd,
-						runner,
-					);
-					break;
-				case "pytest":
-					parsed = this.parsePytestOutput(
-						stdout,
-						stderr,
-						result.status ?? 0,
-						absoluteTestFile,
-						cwd,
-						runner,
-					);
-					break;
-				default:
-					parsed = this.parseGenericRunnerOutput(
-						stdout,
-						stderr,
-						result.status ?? 0,
-						absoluteTestFile,
-						runner,
-					);
-					break;
-			}
-
-			this.recordResult(cwd, runner, absoluteTestFile, parsed);
-			return parsed;
 		} catch (err: any) {
 			this.log(`Run error: ${err.message}`);
 			return this.emptyResult(absoluteTestFile, "", runner, err.message);
@@ -816,122 +643,6 @@ export class TestRunnerClient {
 		};
 	}
 
-	// --- Generic text parser for non-JSON runners ---
-
-	private parseGenericRunnerOutput(
-		stdout: string,
-		stderr: string,
-		exitCode: number,
-		testFile: string,
-		runner: string,
-	): TestResult {
-		const output = `${stdout}\n${stderr}`;
-		const lower = output.toLowerCase();
-
-		let passed = 0;
-		let failed = exitCode === 0 ? 0 : 1;
-		let skipped = 0;
-		let duration = 0;
-
-		const goSummary = output.match(/ok\s+\S+\s+([\d.]+)s/m);
-		if (goSummary) {
-			duration = Number.parseFloat(goSummary[1]) * 1000;
-		}
-
-		const cargoSummary = output.match(
-			/test result:\s+\w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored;/i,
-		);
-		if (cargoSummary) {
-			passed = Number.parseInt(cargoSummary[1], 10);
-			failed = Number.parseInt(cargoSummary[2], 10);
-			skipped = Number.parseInt(cargoSummary[3], 10);
-		}
-
-		const dotnetSummary = output.match(
-			/Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)/i,
-		);
-		if (dotnetSummary) {
-			failed = Number.parseInt(dotnetSummary[1], 10);
-			passed = Number.parseInt(dotnetSummary[2], 10);
-			skipped = Number.parseInt(dotnetSummary[3], 10);
-		}
-
-		const mavenSummary = output.match(
-			/Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)/i,
-		);
-		if (mavenSummary) {
-			const total = Number.parseInt(mavenSummary[1], 10);
-			const failures = Number.parseInt(mavenSummary[2], 10);
-			const errors = Number.parseInt(mavenSummary[3], 10);
-			skipped = Number.parseInt(mavenSummary[4], 10);
-			failed = failures + errors;
-			passed = Math.max(0, total - failed - skipped);
-		}
-
-		const rspecSummary = output.match(/(\d+)\s+examples?,\s+(\d+)\s+failures?/i);
-		if (rspecSummary) {
-			const total = Number.parseInt(rspecSummary[1], 10);
-			failed = Number.parseInt(rspecSummary[2], 10);
-			passed = Math.max(0, total - failed);
-		}
-
-		const minitestSummary = output.match(
-			/(\d+)\s+runs?,\s+\d+\s+assertions?,\s+(\d+)\s+failures?,\s+(\d+)\s+errors?/i,
-		);
-		if (minitestSummary) {
-			const total = Number.parseInt(minitestSummary[1], 10);
-			const failures = Number.parseInt(minitestSummary[2], 10);
-			const errors = Number.parseInt(minitestSummary[3], 10);
-			failed = failures + errors;
-			passed = Math.max(0, total - failed);
-		}
-
-		const gradleSummary = output.match(/(\d+)\s+tests? completed,\s+(\d+)\s+failed/i);
-		if (gradleSummary) {
-			const total = Number.parseInt(gradleSummary[1], 10);
-			failed = Number.parseInt(gradleSummary[2], 10);
-			passed = Math.max(0, total - failed);
-		}
-
-		if (passed === 0 && failed === 0 && skipped === 0 && exitCode === 0) {
-			passed = 1;
-		}
-
-		const failures: TestFailure[] = [];
-		const names = [
-			...output.matchAll(/--- FAIL:\s+([^\s(]+)/g),
-			...output.matchAll(/\bFAILED\s+([^\n]+)/g),
-			...output.matchAll(/Failure:\s+([^\n]+)/g),
-		];
-		for (const m of names.slice(0, 5)) {
-			failures.push({ name: m[1].trim(), message: m[1].trim() });
-		}
-		if (failures.length === 0 && failed > 0) {
-			const firstLine =
-				output
-					.split("\n")
-					.find((l) => /fail|error|exception/i.test(l))
-					?.trim()
-					.slice(0, 300) || `Tests failed for runner ${runner}`;
-			failures.push({ name: `${runner} failure`, message: firstLine });
-		}
-
-		return {
-			file: testFile,
-			sourceFile: "",
-			runner,
-			passed,
-			failed,
-			skipped,
-			failures,
-			duration,
-			error:
-				exitCode !== 0 && failed === 0 && lower.includes("error")
-					? `Runner ${runner} exited with ${exitCode}`
-					: undefined,
-		};
-	}
-
 	// --- Formatting ---
 
 	/**
@@ -1002,32 +713,5 @@ export class TestRunnerClient {
 		// Keep first 3 lines of stack trace
 		const lines = stack.split("\n").slice(0, 3);
 		return lines.join("\n").slice(0, 500);
-	}
-
-	private failedKey(cwd: string, runner: string): string {
-		return `${path.resolve(cwd)}:${runner}`;
-	}
-
-	private recordResult(
-		cwd: string,
-		runner: string,
-		testFile: string,
-		result: TestResult,
-	): void {
-		const key = this.failedKey(cwd, runner);
-		const abs = path.resolve(testFile);
-		const set = this.failedTestsByRunner.get(key) ?? new Set<string>();
-
-		if (result.failed > 0) {
-			set.add(abs);
-			this.failedTestsByRunner.set(key, set);
-			return;
-		}
-
-		if (set.has(abs)) {
-			set.delete(abs);
-			if (set.size === 0) this.failedTestsByRunner.delete(key);
-			else this.failedTestsByRunner.set(key, set);
-		}
 	}
 }

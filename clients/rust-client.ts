@@ -10,7 +10,6 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawn } from "./safe-spawn.js";
 
 // --- Types ---
 
@@ -86,8 +85,10 @@ export class RustClient {
 						return p;
 					}
 				} else {
-					const result = safeSpawn(p, ["--version"], {
+					const result = spawnSync(p, ["--version"], {
+						encoding: "utf-8",
 						timeout: 3000,
+						shell: true,
 					});
 					if (!result.error && result.status === 0) {
 						this.cargoPath = p;
@@ -132,12 +133,15 @@ export class RustClient {
 		if (!fs.existsSync(absolutePath)) return [];
 
 		try {
-			const result = safeSpawn(
-				cargoExe,
+			const cargoCmd = cargoExe.includes(" ") ? `"${cargoExe}"` : cargoExe;
+			const result = spawnSync(
+				cargoCmd,
 				["check", "--message-format", "json"],
 				{
+					encoding: "utf-8",
 					timeout: 60000,
 					cwd,
+					shell: true,
 				},
 			);
 
@@ -156,12 +160,14 @@ export class RustClient {
 		if (!this.isAvailable()) return [];
 
 		try {
-			const result = safeSpawn(
+			const result = spawnSync(
 				"cargo",
 				["clippy", "--message-format", "json"],
 				{
+					encoding: "utf-8",
 					timeout: 60000,
 					cwd,
+					shell: true,
 				},
 			);
 
