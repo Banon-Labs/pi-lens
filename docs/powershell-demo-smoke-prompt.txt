@@ -1,0 +1,6 @@
+Create or overwrite a file named `smoke-powershell-demo.ps1` in the repo root with exactly these two lines:
+
+gps
+}
+
+Then stop immediately after the write result so the inline pi-lens diagnostics remain visible. Do not explain the feature, do not fix the file, and do not perform any extra edits or commands.
