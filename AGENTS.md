@@ -1,5 +1,9 @@
 # AGENTS.md - Project-specific context for pi agents
 
+## Github Fork
+
+You are operating in the fork of another author's repository. Ensure that you never do git or github actions with or against repos that aren't owned by the current git/github user.
+
 ## Knip False Positives
 
 Knip reports all `.ts` files as `[file]` (unused files) because it doesn't
