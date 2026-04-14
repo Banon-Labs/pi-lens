@@ -145,12 +145,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	);
 
-	let pendingBlockingDiagnosticMessage: {
-		content: string;
-		filePath: string;
-		toolName: string;
-	} | null = null;
-
 	const tsClient = new TypeScriptClient();
 	const astGrepClient = new AstGrepClient();
 	const ruffClient = new RuffClient();
@@ -1202,11 +1196,15 @@ export default function (pi: ExtensionAPI) {
 		if (!lspOutput) return;
 
 		if (hasBlockingDiagnostics && dispatchResult?.output?.trim()) {
-			pendingBlockingDiagnosticMessage = {
-				content: dispatchResult.output.trim(),
-				filePath,
-				toolName: event.toolName,
-			};
+			pi.sendMessage(
+				{
+					customType: "pi-lens-blocking-diagnostics",
+					content: dispatchResult.output.trim(),
+					display: true,
+					details: { filePath, toolName: event.toolName },
+				},
+				{ deliverAs: "followUp", triggerTurn: false },
+			);
 		}
 
 		return {
@@ -1219,21 +1217,6 @@ export default function (pi: ExtensionAPI) {
 			),
 			isError: event.isError || hasBlockingDiagnostics,
 		};
-	});
-
-	pi.on("agent_end", async () => {
-		if (!pendingBlockingDiagnosticMessage) return;
-		const pending = pendingBlockingDiagnosticMessage;
-		pendingBlockingDiagnosticMessage = null;
-		pi.sendMessage(
-			{
-				customType: "pi-lens-blocking-diagnostics",
-				content: pending.content,
-				display: true,
-				details: { filePath: pending.filePath, toolName: pending.toolName },
-			},
-			{ triggerTurn: false },
-		);
 	});
 
 	// --- Inject project rules into system prompt ---

@@ -234,9 +234,15 @@ Expected result: Vitest passes, including the PowerShell runner coverage and the
 scripts/pi-lens-powershell-demo-smoke.sh --out-dir /tmp/pi-lens-pwsh-smoke --turn-timeout 240 --quit-after
 ```
 
-This helper now explicitly loads `./index.ts` alongside the authless smoke-sandbox provider so the local pi-lens extension is in the session under test.
+This helper runs authlessly on this branch. It loads:
+- the repo-local deterministic smoke provider fixture at `scripts/pi-lens-smoke-sandbox.ts`
+- the local pi-lens extension at `./index.ts`
 
-Note: the proof tests above are the authoritative local check. The Kitty smoke helper still depends on the shared `pi-smoke-sandbox` PowerShell demo fixture matching the intended blocking sample.
+Expected result:
+- `powershell-demo-tool-result.txt` contains `🔴 STOP — 1 issue(s) must be fixed:`
+- `prompt-after.txt` still shows the pi-lens blocking-diagnostics message after the write settles
+
+The proof tests above remain the primary local gate, but this smoke helper is the reproducible authless demo path for the PowerShell feature.
 
 ---
 

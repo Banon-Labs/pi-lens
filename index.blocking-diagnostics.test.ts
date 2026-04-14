@@ -68,7 +68,7 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("keeps blocking PowerShell diagnostics in tool_result and re-emits them after agent_end", async () => {
+	it("keeps blocking PowerShell diagnostics in tool_result and re-emits them as an immediate follow-up", async () => {
 		const filePath = path.join(tmpDir, "smoke-powershell-demo.ps1");
 		fs.writeFileSync(filePath, "gps | % { $_ }\n}\n");
 
@@ -78,26 +78,27 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 			hasBlockers: true,
 		});
 
-		const { default: registerExtension } = await import("./index.ts");
+		const { default: registerExtension } = await import("./index.js");
 		const { pi, handlers, sentMessages, messageRenderers } = createMockPi();
 		registerExtension(pi as any);
 
 		expect(messageRenderers.has("pi-lens-blocking-diagnostics")).toBe(true);
 
 		const toolResult = handlers.tool_result?.at(-1);
-		const agentEnd = handlers.agent_end?.at(-1);
 		expect(toolResult).toBeTypeOf("function");
-		expect(agentEnd).toBeTypeOf("function");
 
-		const response = await toolResult?.({
-			toolName: "write",
-			input: { path: filePath },
-			details: {},
-			isError: false,
-			content: [
-				{ type: "text", text: "Successfully wrote 19 bytes to smoke-powershell-demo.ps1" },
-			],
-		});
+		const response = await toolResult?.(
+			{
+				toolName: "write",
+				input: { path: filePath },
+				details: {},
+				isError: false,
+				content: [
+					{ type: "text", text: "Successfully wrote 19 bytes to smoke-powershell-demo.ps1" },
+				],
+			},
+			{},
+		);
 
 		expect(response).toEqual({
 			content: [
@@ -110,7 +111,7 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 			isError: true,
 		});
 
-		await agentEnd?.({}, {});
+		await Promise.resolve();
 
 		expect(sentMessages).toHaveLength(1);
 		expect(sentMessages[0]).toEqual({
@@ -121,7 +122,7 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 				display: true,
 				details: { filePath, toolName: "write" },
 			},
-			options: { triggerTurn: false },
+			options: { deliverAs: "followUp", triggerTurn: false },
 		});
 	});
 
@@ -135,22 +136,23 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 			hasBlockers: false,
 		});
 
-		const { default: registerExtension } = await import("./index.ts");
+		const { default: registerExtension } = await import("./index.js");
 		const { pi, handlers, sentMessages } = createMockPi();
 		registerExtension(pi as any);
 
 		const toolResult = handlers.tool_result?.at(-1);
-		const agentEnd = handlers.agent_end?.at(-1);
 		expect(toolResult).toBeTypeOf("function");
-		expect(agentEnd).toBeTypeOf("function");
 
-		const response = await toolResult?.({
-			toolName: "write",
-			input: { path: filePath },
-			details: {},
-			isError: false,
-			content: [{ type: "text", text: "Successfully wrote 12 bytes to smoke-powershell-demo.ps1" }],
-		});
+		const response = await toolResult?.(
+			{
+				toolName: "write",
+				input: { path: filePath },
+				details: {},
+				isError: false,
+				content: [{ type: "text", text: "Successfully wrote 12 bytes to smoke-powershell-demo.ps1" }],
+			},
+			{},
+		);
 
 		expect(response).toEqual({
 			content: [
@@ -162,8 +164,6 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 			],
 			isError: false,
 		});
-
-		await agentEnd?.({}, {});
 
 		expect(sentMessages).toHaveLength(0);
 	});

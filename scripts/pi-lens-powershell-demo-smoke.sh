@@ -111,6 +111,7 @@ cmd=(
 	--title "$title"
 	--tools "read,grep,find,ls,write,edit,bash"
 	--turn-timeout "$turn_timeout"
+	--smoke-sandbox-extension "$repo_root/scripts/pi-lens-smoke-sandbox.ts"
 	--pi-arg --extension
 	--pi-arg "$repo_root/index.ts"
 	--phrase "$phrase"
