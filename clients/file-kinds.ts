@@ -14,6 +14,7 @@ export type FileKind =
 	| "python" // Python (.py)
 	| "go" // Go (.go)
 	| "rust" // Rust (.rs)
+	| "powershell" // PowerShell (.ps1, .psm1, .psd1)
 	| "cxx" // C/C++ (.c, .cc, .cpp, .h, .hpp, .cxx, etc.)
 	| "cmake" // CMake (.cmake, CMakeLists.txt)
 	| "shell" // Shell (.sh, .bash)
@@ -29,6 +30,7 @@ const KIND_EXTENSIONS: Record<FileKind, readonly string[]> = {
 	python: [".py"],
 	go: [".go"],
 	rust: [".rs"],
+	powershell: [".ps1", ".psm1", ".psd1"],
 	cxx: [
 		".c",
 		".cc",
@@ -135,7 +137,15 @@ export function getFileKindsForExtension(ext: string): FileKind[] {
  * Check if a file kind represents a code file (not config/markdown).
  */
 export function isCodeKind(kind: FileKind): boolean {
-	return ["jsts", "python", "go", "rust", "cxx", "shell"].includes(kind);
+	return [
+		"jsts",
+		"python",
+		"go",
+		"rust",
+		"powershell",
+		"cxx",
+		"shell",
+	].includes(kind);
 }
 
 /**
@@ -154,6 +164,7 @@ export function getFileKindLabel(kind: FileKind): string {
 		python: "Python",
 		go: "Go",
 		rust: "Rust",
+		powershell: "PowerShell",
 		cxx: "C/C++",
 		cmake: "CMake",
 		shell: "Shell",
@@ -180,13 +191,17 @@ export function isScannableFile(filePath: string): boolean {
 	const kind = detectFileKind(filePath);
 	if (!kind) return false;
 
-	// Exclude test files for most kinds
 	const base = basename(filePath);
+	const baseLower = base.toLowerCase();
+
+	// Exclude test files and PowerShell analyzer config files
 	if (
 		base.includes(".test.") ||
 		base.includes(".spec.") ||
 		base.startsWith("test-") ||
-		base.startsWith("spec-")
+		base.startsWith("spec-") ||
+		baseLower.includes(".tests.") ||
+		baseLower === "psscriptanalyzersettings.psd1"
 	) {
 		return false;
 	}
@@ -204,6 +219,7 @@ export function getLanguageId(kind: FileKind): string {
 		python: "python",
 		go: "go",
 		rust: "rust",
+		powershell: "powershell",
 		cxx: "cpp",
 		cmake: "cmake",
 		shell: "shell",

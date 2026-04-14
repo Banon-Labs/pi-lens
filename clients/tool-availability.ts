@@ -79,6 +79,26 @@ export const TOOL_REGISTRY: ToolInfo[] = [
 		versionCommand: ["--version"],
 		versionPattern: /(\d+\.\d+\.\d+)/,
 	},
+	{
+		name: "pwsh",
+		command: "pwsh",
+		versionCommand: [
+			"-NoProfile",
+			"-Command",
+			"$PSVersionTable.PSVersion.ToString()",
+		],
+		versionPattern: /(\d+\.\d+\.\d+)/,
+	},
+	{
+		name: "psscriptanalyzer",
+		command: "pwsh",
+		versionCommand: [
+			"-NoProfile",
+			"-Command",
+			"(Get-Module -ListAvailable PSScriptAnalyzer | Sort-Object Version -Descending | Select-Object -First 1).Version.ToString()",
+		],
+		versionPattern: /(\d+\.\d+\.\d+)/,
+	},
 ];
 
 // --- Cache ---

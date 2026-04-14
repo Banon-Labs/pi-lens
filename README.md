@@ -32,7 +32,7 @@ file → detectFileKind() → getRunnersForKind() → run all runners → aggreg
 - **Delta mode built-in**: Each runner supports baseline tracking to show only *new* violations
 - **Conditional execution**: Runners can have `when` conditions (e.g., only run when `--autofix` is enabled)
 
-**Runners:** `ts-lsp`, `biome`, `ruff`, `ast-grep`, `type-safety`, `architect`, `go-vet`, `rust-clippy`
+**Runners:** `ts-lsp`, `biome`, `ruff`, `psscriptanalyzer`, `ast-grep`, `type-safety`, `architect`, `go-vet`, `rust-clippy`
 
 ### Asynchronous Session Start
 
@@ -74,7 +74,7 @@ return {
 Centralized file-kind detection (`clients/file-kinds.ts`) replaces scattered regex checks:
 
 ```typescript
-const kind = detectFileKind(filePath); // "jsts" | "python" | "go" | "rust" | ...
+const kind = detectFileKind(filePath); // "jsts" | "python" | "go" | "rust" | "powershell" | ...
 const runners = getRunnersForKind(kind); // All applicable runners
 ```
 
@@ -327,6 +327,9 @@ Each rule includes a `message` and `note` that are shown in diagnostics, so the 
 | `type-coverage` | `npm i -D type-coverage` | TypeScript `any` coverage percentage |
 | `madge` | `npm i -D madge` | Circular dependency detection |
 | `ruff` | `pip install ruff` | Python lint + format + autofix |
+| `pwsh` + `PSScriptAnalyzer` | `Install-Module PSScriptAnalyzer -Scope CurrentUser` | PowerShell static analysis via `Invoke-ScriptAnalyzer` |
+
+PowerShell note: in WSL setups where `pwsh` resolves to Windows PowerShell 7, pi-lens translates file paths for analyzer invocations automatically.
 
 ---
 
