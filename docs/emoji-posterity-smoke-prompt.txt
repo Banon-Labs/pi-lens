@@ -1,0 +1,3 @@
+PI_LENS_EMOJI_POSTERITY_DEMO
+
+Run the pi-lens emoji posterity demo. Use the standard PowerShell blocker sample so the session shows the real pi-lens blocker and warning output, then finish with a short ✅ completion marker for posterity. Do not explain the feature, do not fix the file, and do not perform extra edits or commands.

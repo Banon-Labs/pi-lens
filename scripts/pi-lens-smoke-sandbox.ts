@@ -19,6 +19,7 @@ const TS_BLOCKER_CONTENT = `function demo(flag: boolean): number {\n  if (flag) 
 
 const POWERSHELL_BLOCKER_PATH = "smoke-powershell-demo.ps1";
 const POWERSHELL_BLOCKER_CONTENT = `gps\n}\n`;
+const EMOJI_POSTERITY_MARKER = "PI_LENS_EMOJI_POSTERITY_DEMO";
 
 type TextBlock = { type: "text"; text: string };
 
@@ -30,6 +31,7 @@ function extractScenarioText(text: string): string | null {
 		/^reply with exactly\s+/i.test(text) ||
 		text.includes(TS_BLOCKER_PATH) ||
 		text.includes(POWERSHELL_BLOCKER_PATH) ||
+		text.includes(EMOJI_POSTERITY_MARKER) ||
 		/klaatu berada nikto/i.test(text)
 	) {
 		return text;
@@ -124,11 +126,40 @@ function emitToolCall(
 
 function buildResponsePlan(
 	userText: string,
-): { type: "text"; text: string } | { type: "tool"; toolCall: ToolCall } {
+	hasResult: boolean,
+):
+	| { type: "text"; text: string }
+	| { type: "tool"; toolCall: ToolCall }
+	| null {
 	const trimmed = userText.trim();
 	const exactMatch = trimmed.match(/^reply with exactly\s+([\s\S]+)$/i);
 	if (exactMatch) {
 		return { type: "text", text: exactMatch[1] ?? "" };
+	}
+
+	if (trimmed.includes(EMOJI_POSTERITY_MARKER)) {
+		if (hasResult) {
+			return {
+				type: "text",
+				text: "✅ Posterity demo complete — above, pi-lens showed the real 🔴 blocker and 🟡 warning from the PowerShell write.",
+			};
+		}
+		return {
+			type: "tool",
+			toolCall: {
+				type: "toolCall",
+				id: "call_smoke_write_emoji_posterity_demo",
+				name: "write",
+				arguments: {
+					path: POWERSHELL_BLOCKER_PATH,
+					content: POWERSHELL_BLOCKER_CONTENT,
+				},
+			},
+		};
+	}
+
+	if (hasResult) {
+		return null;
 	}
 
 	if (trimmed.includes(TS_BLOCKER_PATH)) {
@@ -186,17 +217,17 @@ function streamSmokeSandbox(
 		try {
 			stream.push({ type: "start", partial: output });
 
-			if (hasToolResult(context.messages)) {
+			const hasResult = hasToolResult(context.messages);
+			const contextPromptText = getLastUserText(context.messages);
+			const promptText =
+				extractScenarioText(contextPromptText) || lastInteractiveInputText;
+			const plan = buildResponsePlan(promptText, hasResult);
+			if (!plan) {
 				output.stopReason = "stop";
 				stream.push({ type: "done", reason: "stop", message: output });
 				stream.end();
 				return;
 			}
-
-			const contextPromptText = getLastUserText(context.messages);
-			const promptText =
-				extractScenarioText(contextPromptText) || lastInteractiveInputText;
-			const plan = buildResponsePlan(promptText);
 			if (plan.type === "text") {
 				emitText(stream, output, plan.text);
 				output.stopReason = "stop";

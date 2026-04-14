@@ -244,6 +244,16 @@ Expected result:
 
 The proof tests above remain the primary local gate, but this smoke helper is the reproducible authless demo path for the PowerShell feature.
 
+3. One-prompt emoji posterity demo
+
+```bash
+scripts/pi-lens-emoji-posterity-smoke.sh --out-dir /tmp/pi-lens-emoji-demo --turn-timeout 240 --quit-after
+```
+
+Expected result:
+- the PowerShell write emits the real pi-lens `🔴 STOP` blocker and `🟡` warning
+- the final frame also includes a short `✅` posterity marker from the repo-local smoke harness
+
 ---
 
 ## Flags
