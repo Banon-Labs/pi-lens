@@ -12,6 +12,7 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isFileKind } from "./file-kinds.js";
 
 // --- Types ---
 
@@ -73,6 +74,13 @@ export class DependencyChecker {
 		}
 
 		return this.available;
+	}
+
+	/**
+	 * Check if a file is relevant for madge-based dependency analysis.
+	 */
+	isSupportedFile(filePath: string): boolean {
+		return isFileKind(filePath, "jsts");
 	}
 
 	/**
@@ -180,6 +188,15 @@ export class DependencyChecker {
 	 */
 	checkFile(filePath: string, cwd?: string): DepCheckResult {
 		const normalized = path.resolve(filePath);
+
+		if (!this.isSupportedFile(normalized)) {
+			return {
+				hasCircular: false,
+				circular: [],
+				checked: false,
+				cacheHit: false,
+			};
+		}
 
 		// Return early for non-existent files without running availability check
 		if (!fs.existsSync(normalized)) {

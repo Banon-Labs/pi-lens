@@ -13,12 +13,35 @@ import {
 	getRunnersForKind,
 } from "./dispatcher.js";
 import { TOOL_PLANS } from "./plan.js";
-import type { BaselineStore, PiAgentAPI } from "./types.js";
+import type { BaselineStore, DispatchResult, PiAgentAPI } from "./types.js";
 
 // Import runners to register them
 import "./runners/index.js";
 
 const sharedLintBaselines = createBaselineStore();
+
+/**
+ * Run linting for a file using the declarative dispatch system.
+ */
+export async function dispatchLintResult(
+	filePath: string,
+	cwd: string,
+	pi: PiAgentAPI,
+	baselines: BaselineStore = sharedLintBaselines,
+): Promise<DispatchResult | null> {
+	if (!isScannableFile(filePath)) {
+		return null;
+	}
+
+	const ctx = createDispatchContext(filePath, cwd, pi, baselines);
+	const kind = ctx.kind;
+	if (!kind) return null;
+
+	const plan = TOOL_PLANS[kind];
+	if (!plan) return null;
+
+	return dispatchForFile(ctx, plan.groups);
+}
 
 /**
  * Run linting for a file using the declarative dispatch system
@@ -34,19 +57,8 @@ export async function dispatchLint(
 	pi: PiAgentAPI,
 	baselines: BaselineStore = sharedLintBaselines,
 ): Promise<string> {
-	if (!isScannableFile(filePath)) {
-		return "";
-	}
-
-	const ctx = createDispatchContext(filePath, cwd, pi, baselines);
-	const kind = ctx.kind;
-	if (!kind) return "";
-
-	const plan = TOOL_PLANS[kind];
-	if (!plan) return "";
-
-	const result = await dispatchForFile(ctx, plan.groups);
-	return result.output;
+	const result = await dispatchLintResult(filePath, cwd, pi, baselines);
+	return result?.output ?? "";
 }
 
 /**
