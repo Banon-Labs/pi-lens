@@ -5,12 +5,20 @@
  * with the existing index.ts tool_result handler.
  */
 
-import { detectFileKind } from "../file-kinds.js";
-import { createBaselineStore, createDispatchContext } from "./dispatcher.js";
-import type { PiAgentAPI } from "./types.js";
+import { isScannableFile } from "../file-kinds.js";
+import {
+	createBaselineStore,
+	createDispatchContext,
+	dispatchForFile,
+	getRunnersForKind,
+} from "./dispatcher.js";
+import { TOOL_PLANS } from "./plan.js";
+import type { BaselineStore, PiAgentAPI } from "./types.js";
 
 // Import runners to register them
 import "./runners/index.js";
+
+const sharedLintBaselines = createBaselineStore();
 
 /**
  * Run linting for a file using the declarative dispatch system
@@ -24,14 +32,13 @@ export async function dispatchLint(
 	filePath: string,
 	cwd: string,
 	pi: PiAgentAPI,
+	baselines: BaselineStore = sharedLintBaselines,
 ): Promise<string> {
-	const ctx = createDispatchContext(filePath, cwd, pi);
+	if (!isScannableFile(filePath)) {
+		return "";
+	}
 
-	// Import dispatchForFile dynamically to avoid circular deps
-	const { dispatchForFile } = await import("./dispatcher.js");
-	const { getRunnersForKind } = await import("./dispatcher.js");
-	const { TOOL_PLANS } = await import("./plan.js");
-
+	const ctx = createDispatchContext(filePath, cwd, pi, baselines);
 	const kind = ctx.kind;
 	if (!kind) return "";
 
@@ -45,27 +52,26 @@ export async function dispatchLint(
 /**
  * Create a baseline store for delta mode tracking
  */
-export function createLintBaselines() {
+export function createLintBaselines(): BaselineStore {
 	return createBaselineStore();
 }
 
 /**
- * Check if a file should be processed by the dispatcher
- * based on the file kind
+ * Check if a file should be processed by the dispatcher.
  */
 export function shouldDispatch(filePath: string): boolean {
-	const kind = detectFileKind(filePath);
-	return kind !== undefined;
+	return isScannableFile(filePath);
 }
 
 /**
- * Get list of available runners for a file
+ * Get list of available runners for a file.
  */
 export async function getAvailableRunners(filePath: string): Promise<string[]> {
-	const kind = detectFileKind(filePath);
-	if (!kind) return [];
+	if (!isScannableFile(filePath)) return [];
 
-	const { getRunnersForKind } = await import("./dispatcher.js");
-	const runners = getRunnersForKind(kind);
-	return runners.map((r) => r.id);
+	const ctx = createDispatchContext(filePath, process.cwd(), {
+		getFlag: () => false,
+	});
+	const runners = getRunnersForKind(ctx.kind);
+	return runners.map((runner) => runner.id);
 }

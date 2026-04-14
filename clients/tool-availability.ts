@@ -95,7 +95,7 @@ export const TOOL_REGISTRY: ToolInfo[] = [
 		versionCommand: [
 			"-NoProfile",
 			"-Command",
-			"(Get-Module -ListAvailable PSScriptAnalyzer | Sort-Object Version -Descending | Select-Object -First 1).Version.ToString()",
+			"$module = Get-Module -ListAvailable PSScriptAnalyzer | Sort-Object Version -Descending | Select-Object -First 1; if ($module) { $module.Version.ToString() } else { exit 1 }",
 		],
 		versionPattern: /(\d+\.\d+\.\d+)/,
 	},
@@ -139,7 +139,7 @@ export function isToolAvailable(toolName: string): boolean {
 		const result = spawnSync(toolName, ["--version"], {
 			encoding: "utf-8",
 			timeout: 5000,
-			shell: true,
+			shell: false,
 		});
 		const available = !result.error && result.status === 0;
 		TOOL_CACHE.set(toolName, {
@@ -157,13 +157,16 @@ export function isToolAvailable(toolName: string): boolean {
 		const result = spawnSync(tool.command, tool.versionCommand, {
 			encoding: "utf-8",
 			timeout: 10000,
-			shell: true,
+			shell: false,
 		});
-		const available = !result.error && result.status === 0;
 		const output = result.stdout + result.stderr;
 		const version = tool.versionPattern
 			? extractVersion(output, tool.versionPattern)
 			: undefined;
+		const available =
+			!result.error &&
+			result.status === 0 &&
+			(!!version || output.trim().length > 0);
 
 		TOOL_CACHE.set(toolName, {
 			available,
@@ -192,7 +195,7 @@ export function getToolVersion(toolName: string): string | undefined {
 		const result = spawnSync(tool.command, tool.versionCommand, {
 			encoding: "utf-8",
 			timeout: 10000,
-			shell: true,
+			shell: false,
 		});
 		if (!result.error && result.status === 0) {
 			const output = result.stdout + result.stderr;

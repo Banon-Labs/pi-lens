@@ -205,7 +205,16 @@ npm install -D madge
 
 # Python support
 pip install ruff
+
+# PowerShell support
+pwsh -NoProfile -Command "Install-Module PSScriptAnalyzer -Scope CurrentUser"
 ```
+
+PowerShell dispatch notes:
+- pi-lens analyzes `.ps1`, `.psm1`, and `.psd1` files with `PSScriptAnalyzer`
+- repo-root `PSScriptAnalyzerSettings.psd1` is passed explicitly when present so nested PowerShell files inherit the project settings consistently
+- parse errors are surfaced even when project settings suppress them
+- `PSScriptAnalyzerSettings.psd1` itself is excluded from ordinary write-time linting
 
 ---
 
@@ -223,6 +232,9 @@ pip install ruff
 | `--no-tests` | `false` | Disable test runner on write |
 | `--no-go` | `false` | Disable Go linting |
 | `--no-rust` | `false` | Disable Rust linting |
+| `--no-powershell` | `false` | Disable PowerShell static analysis |
+| `--no-delta` | `false` | Show full dispatch results instead of only new findings |
+| `--stop-on-error` | `false` | Stop dispatch after the first blocking diagnostic group |
 | `--lens-verbose` | `false` | Enable verbose logging |
 
 ---
@@ -329,7 +341,7 @@ Each rule includes a `message` and `note` that are shown in diagnostics, so the 
 | `ruff` | `pip install ruff` | Python lint + format + autofix |
 | `pwsh` + `PSScriptAnalyzer` | `Install-Module PSScriptAnalyzer -Scope CurrentUser` | PowerShell static analysis via `Invoke-ScriptAnalyzer` |
 
-PowerShell note: in WSL setups where `pwsh` resolves to Windows PowerShell 7, pi-lens translates file paths for analyzer invocations automatically.
+PowerShell note: in WSL setups where `pwsh` resolves to Windows PowerShell 7, pi-lens translates both target-file and settings-file paths for analyzer invocations automatically while keeping user-facing diagnostics keyed to the local edited path.
 
 ---
 

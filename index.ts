@@ -210,6 +210,24 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
+	pi.registerFlag("no-powershell", {
+		description: "Disable PowerShell static analysis",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("no-delta", {
+		description: "Show all dispatch diagnostics instead of only new findings",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("stop-on-error", {
+		description: "Stop dispatch after the first blocking diagnostic group",
+		type: "boolean",
+		default: false,
+	});
+
 	// --- Commands ---
 
 	pi.registerCommand("lens-booboo", {
