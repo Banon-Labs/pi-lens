@@ -22,6 +22,7 @@ function createMockPi(flagOverrides: Record<string, boolean> = {}) {
 		["no-ast-grep", false],
 		["no-ruff", false],
 		["no-madge", false],
+		["no-tests", true],
 		...Object.entries(flagOverrides),
 	]);
 	const sentMessages: Array<{ message: any; options: any }> = [];
@@ -53,17 +54,21 @@ function createMockPi(flagOverrides: Record<string, boolean> = {}) {
 	return { pi, handlers, commands, messageRenderers, sentMessages };
 }
 
-describe("index PowerShell blocking diagnostics behavior", () => {
+describe("index blocking diagnostics behavior", () => {
 	let tmpDir: string;
+	let originalCwd: string;
 
 	beforeEach(() => {
 		vi.resetModules();
 		vi.clearAllMocks();
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-powershell-blocking-test-"));
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-blocking-test-"));
+		originalCwd = process.cwd();
+		process.chdir(tmpDir);
 		dispatchLintResultMock.mockReset();
 	});
 
 	afterEach(() => {
+		process.chdir(originalCwd);
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 		vi.restoreAllMocks();
 	});
@@ -124,6 +129,64 @@ describe("index PowerShell blocking diagnostics behavior", () => {
 			},
 			options: { deliverAs: "followUp", triggerTurn: false },
 		});
+	});
+
+	it("keeps generic blocking diagnostics visibly surfaced by the end of the turn", async () => {
+		const filePath = path.join(tmpDir, "smoke-blocking-demo.ts");
+		fs.writeFileSync(
+			filePath,
+			"function demo(flag: boolean): number {\n  if (flag) {\n    return 1;\n  }\n}\n",
+		);
+
+		dispatchLintResultMock.mockResolvedValue({
+			output:
+				"🔴 STOP — 1 issue(s) must be fixed:\n  L1: Function lacks ending return statement and return type does not include 'undefined'.",
+			hasBlockers: true,
+		});
+
+		const { default: registerExtension } = await import("./index.js");
+		const { pi, handlers, sentMessages, messageRenderers } = createMockPi();
+		registerExtension(pi as any);
+
+		expect(messageRenderers.has("pi-lens-blocking-diagnostics")).toBe(true);
+
+		const toolResult = handlers.tool_result?.at(-1);
+		expect(toolResult).toBeTypeOf("function");
+
+		const response = (await toolResult?.(
+			{
+				toolName: "write",
+				input: { path: filePath },
+				details: {},
+				isError: false,
+				content: [
+					{ type: "text", text: "Successfully wrote 73 bytes to smoke-blocking-demo.ts" },
+				],
+			},
+			{},
+		)) as { content?: Array<{ type?: string; text?: string }> } | undefined;
+
+		const inlineText = (response?.content ?? [])
+			.filter((item) => item?.type === "text")
+			.map((item) => item.text ?? "")
+			.join("\n");
+		expect(inlineText).toContain("🔴 STOP — 1 issue(s) must be fixed:");
+
+		await Promise.resolve();
+
+		expect(sentMessages).toContainEqual(
+			expect.objectContaining({
+				message: expect.objectContaining({
+					customType: "pi-lens-blocking-diagnostics",
+					content: expect.stringContaining("🔴 STOP — 1 issue(s) must be fixed:"),
+					display: true,
+				}),
+				options: expect.objectContaining({
+					deliverAs: "followUp",
+					triggerTurn: false,
+				}),
+			}),
+		);
 	});
 
 	it("does not re-emit a sticky blocker for warning-only PowerShell output", async () => {
