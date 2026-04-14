@@ -20,7 +20,7 @@ const astGrepRunner: RunnerDefinition = {
 	id: "ast-grep",
 	appliesTo: ["jsts", "python", "go", "rust", "cxx"],
 	priority: 30,
-	enabledByDefault: false,
+	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		// Check if ast-grep is available

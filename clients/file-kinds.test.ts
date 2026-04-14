@@ -40,6 +40,12 @@ describe("detectFileKind", () => {
 		expect(detectFileKind("lib/app.rs")).toBe("rust");
 	});
 
+	it("should detect PowerShell files", () => {
+		expect(detectFileKind("script.ps1")).toBe("powershell");
+		expect(detectFileKind("module.psm1")).toBe("powershell");
+		expect(detectFileKind("PSScriptAnalyzerSettings.psd1")).toBe("powershell");
+	});
+
 	it("should detect C++ files", () => {
 		expect(detectFileKind("main.cpp")).toBe("cxx");
 		expect(detectFileKind("header.hpp")).toBe("cxx");
@@ -119,6 +125,7 @@ describe("isCodeKind", () => {
 		expect(isCodeKind("python")).toBe(true);
 		expect(isCodeKind("go")).toBe(true);
 		expect(isCodeKind("rust")).toBe(true);
+		expect(isCodeKind("powershell")).toBe(true);
 		expect(isCodeKind("cxx")).toBe(true);
 		expect(isCodeKind("shell")).toBe(true);
 	});
@@ -149,6 +156,7 @@ describe("isScannableFile", () => {
 	it("should return true for code files", () => {
 		expect(isScannableFile("app.ts")).toBe(true);
 		expect(isScannableFile("app.py")).toBe(true);
+		expect(isScannableFile("script.ps1")).toBe(true);
 	});
 
 	it("should return true for config files", () => {
@@ -160,6 +168,11 @@ describe("isScannableFile", () => {
 		expect(isScannableFile("app.test.ts")).toBe(false);
 		expect(isScannableFile("app.spec.ts")).toBe(false);
 		expect(isScannableFile("test-app.ts")).toBe(false);
+		expect(isScannableFile("Example.Tests.ps1")).toBe(false);
+	});
+
+	it("should return false for PowerShell analyzer settings files", () => {
+		expect(isScannableFile("PSScriptAnalyzerSettings.psd1")).toBe(false);
 	});
 
 	it("should return false for unknown extensions", () => {
@@ -173,6 +186,7 @@ describe("getLanguageId", () => {
 		expect(getLanguageId("python")).toBe("python");
 		expect(getLanguageId("go")).toBe("go");
 		expect(getLanguageId("rust")).toBe("rust");
+		expect(getLanguageId("powershell")).toBe("powershell");
 		expect(getLanguageId("cxx")).toBe("cpp");
 		expect(getLanguageId("json")).toBe("json");
 	});
@@ -195,12 +209,18 @@ describe("getExtensionsForKind", () => {
 		const exts = getExtensionsForKind("python");
 		expect(exts).toEqual([".py"]);
 	});
+
+	it("should return extensions for powershell", () => {
+		const exts = getExtensionsForKind("powershell");
+		expect(exts).toEqual([".ps1", ".psm1", ".psd1"]);
+	});
 });
 
 describe("getFileKindLabel", () => {
 	it("should return human-readable labels", () => {
 		expect(getFileKindLabel("jsts")).toBe("JavaScript/TypeScript");
 		expect(getFileKindLabel("python")).toBe("Python");
+		expect(getFileKindLabel("powershell")).toBe("PowerShell");
 		expect(getFileKindLabel("cxx")).toBe("C/C++");
 	});
 

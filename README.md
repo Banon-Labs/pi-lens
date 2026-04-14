@@ -32,7 +32,7 @@ file → detectFileKind() → getRunnersForKind() → run all runners → aggreg
 - **Delta mode built-in**: Each runner supports baseline tracking to show only *new* violations
 - **Conditional execution**: Runners can have `when` conditions (e.g., only run when `--autofix` is enabled)
 
-**Runners:** `ts-lsp`, `biome`, `ruff`, `ast-grep`, `type-safety`, `architect`, `go-vet`, `rust-clippy`
+**Runners:** `ts-lsp`, `biome`, `ruff`, `psscriptanalyzer`, `ast-grep`, `type-safety`, `architect`, `go-vet`, `rust-clippy`
 
 ### Asynchronous Session Start
 
@@ -74,7 +74,7 @@ return {
 Centralized file-kind detection (`clients/file-kinds.ts`) replaces scattered regex checks:
 
 ```typescript
-const kind = detectFileKind(filePath); // "jsts" | "python" | "go" | "rust" | ...
+const kind = detectFileKind(filePath); // "jsts" | "python" | "go" | "rust" | "powershell" | ...
 const runners = getRunnersForKind(kind); // All applicable runners
 ```
 
@@ -205,7 +205,54 @@ npm install -D madge
 
 # Python support
 pip install ruff
+
+# PowerShell support
+pwsh -NoProfile -Command "Install-Module PSScriptAnalyzer -Scope CurrentUser"
 ```
+
+PowerShell dispatch notes:
+- pi-lens analyzes `.ps1`, `.psm1`, and `.psd1` files with `PSScriptAnalyzer`
+- repo-root `PSScriptAnalyzerSettings.psd1` is passed explicitly when present so nested PowerShell files inherit the project settings consistently
+- parse errors are surfaced even when project settings suppress them
+- `PSScriptAnalyzerSettings.psd1` itself is excluded from ordinary write-time linting
+
+### Validate PowerShell support locally
+
+Use the proof tests below as the primary local gate for this branch.
+
+1. Runner + lifecycle proof tests
+
+```bash
+npm test -- clients/dispatch/runners/powershell.test.ts index.blocking-diagnostics.test.ts
+```
+
+Expected result: Vitest passes, including the PowerShell runner coverage and the blocking-diagnostics lifecycle proof.
+
+2. Optional Kitty smoke helper
+
+```bash
+scripts/pi-lens-powershell-demo-smoke.sh --out-dir /tmp/pi-lens-pwsh-smoke --turn-timeout 240 --quit-after
+```
+
+This helper runs authlessly on this branch. It loads:
+- the repo-local deterministic smoke provider fixture at `scripts/pi-lens-smoke-sandbox.ts`
+- the local pi-lens extension at `./index.ts`
+
+Expected result:
+- `powershell-demo-tool-result.txt` contains `🔴 STOP — 1 issue(s) must be fixed:`
+- `prompt-after.txt` still shows the pi-lens blocking-diagnostics message after the write settles
+
+The proof tests above remain the primary local gate, but this smoke helper is the reproducible authless demo path for the PowerShell feature.
+
+3. One-prompt emoji posterity demo
+
+```bash
+scripts/pi-lens-emoji-posterity-smoke.sh --out-dir /tmp/pi-lens-emoji-demo --turn-timeout 240 --quit-after
+```
+
+Expected result:
+- the PowerShell write emits the real pi-lens `🔴 STOP` blocker and `🟡` warning
+- the final frame also includes a short `✅` posterity marker from the repo-local smoke harness
 
 ---
 
@@ -223,6 +270,9 @@ pip install ruff
 | `--no-tests` | `false` | Disable test runner on write |
 | `--no-go` | `false` | Disable Go linting |
 | `--no-rust` | `false` | Disable Rust linting |
+| `--no-powershell` | `false` | Disable PowerShell static analysis |
+| `--no-delta` | `false` | Show full dispatch results instead of only new findings |
+| `--stop-on-error` | `false` | Stop dispatch after the first blocking diagnostic group |
 | `--lens-verbose` | `false` | Enable verbose logging |
 
 ---
@@ -327,6 +377,9 @@ Each rule includes a `message` and `note` that are shown in diagnostics, so the 
 | `type-coverage` | `npm i -D type-coverage` | TypeScript `any` coverage percentage |
 | `madge` | `npm i -D madge` | Circular dependency detection |
 | `ruff` | `pip install ruff` | Python lint + format + autofix |
+| `pwsh` + `PSScriptAnalyzer` | `Install-Module PSScriptAnalyzer -Scope CurrentUser` | PowerShell static analysis via `Invoke-ScriptAnalyzer` |
+
+PowerShell note: in WSL setups where `pwsh` resolves to Windows PowerShell 7, pi-lens translates both target-file and settings-file paths for analyzer invocations automatically while keeping user-facing diagnostics keyed to the local edited path.
 
 ---
 

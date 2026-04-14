@@ -21,22 +21,42 @@ describe("JscpdClient", () => {
 	});
 
 	describe("isAvailable", () => {
-		it("should check jscpd availability", () => {
-			const available = client.isAvailable();
-			expect(typeof available).toBe("boolean");
+		it(
+			"should check jscpd availability",
+			{ timeout: 15000 },
+			() => {
+				const available = client.isAvailable();
+				expect(typeof available).toBe("boolean");
+			},
+		);
+	});
+
+	describe("isSupportedFile", () => {
+		it("supports duplicate scanning for code files", () => {
+			expect(client.isSupportedFile("src/example.ts")).toBe(true);
+			expect(client.isSupportedFile("src/example.py")).toBe(true);
+		});
+
+		it("skips duplicate scanning for PowerShell files", () => {
+			expect(client.isSupportedFile("scripts/demo.ps1")).toBe(false);
 		});
 	});
 
 	describe("scan", () => {
-		it("should return success=false when not available", () => {
-			// Create a mock that returns false
-			const mockClient = new JscpdClient();
-			if (mockClient.isAvailable()) return; // Skip if available
+		it(
+			"should return success=false when not available",
+			{ timeout: 15000 },
+			() => {
+				// Create a mock that returns false
+				const mockClient = new JscpdClient();
+				if (mockClient.isAvailable()) return; // Skip if available
 
-			const result = mockClient.scan(tmpDir);
-			expect(result.success).toBe(false);
-			expect(result.clones).toEqual([]);
-		});
+				createTempFile(tmpDir, "file1.ts", "const x = 1;\n");
+				const result = mockClient.scan(tmpDir);
+				expect(result.success).toBe(false);
+				expect(result.clones).toEqual([]);
+			},
+		);
 
 		it("should detect duplicate code blocks", { timeout: 15000 }, () => {
 			if (!client.isAvailable()) return;

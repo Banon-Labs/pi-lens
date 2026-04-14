@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
+import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { AgentBehaviorClient } from "./clients/agent-behavior-client.js";
 import { ArchitectClient } from "./clients/architect-client.js";
@@ -11,7 +12,8 @@ import { BiomeClient } from "./clients/biome-client.js";
 import { CacheManager } from "./clients/cache-manager.js";
 import { ComplexityClient } from "./clients/complexity-client.js";
 import { DependencyChecker } from "./clients/dependency-checker.js";
-import { dispatchLint } from "./clients/dispatch/integration.js";
+import { dispatchLintResult } from "./clients/dispatch/integration.js";
+import { detectFileKind } from "./clients/file-kinds.js";
 import { GoClient } from "./clients/go-client.js";
 import { buildInterviewer } from "./clients/interviewer.js";
 import { JscpdClient } from "./clients/jscpd-client.js";
@@ -110,9 +112,39 @@ function log(msg: string) {
 	if (_verbose) console.error(`[pi-lens] ${msg}`);
 }
 
+function mergeToolResultText(
+	content: Array<
+		{ type: "text"; text: string } | { type: string; [key: string]: unknown }
+	>,
+	appendedText: string,
+): Array<{ type: "text"; text: string }> {
+	const existingText = content
+		.filter(
+			(item): item is { type: "text"; text: string } => item.type === "text",
+		)
+		.map((item) => item.text)
+		.join("\n");
+	const extraText = appendedText.trim();
+	const combined = [existingText.trimEnd(), extraText]
+		.filter(Boolean)
+		.join("\n\n");
+	return [{ type: "text", text: combined }];
+}
+
 // --- Extension ---
 
 export default function (pi: ExtensionAPI) {
+	pi.registerMessageRenderer(
+		"pi-lens-blocking-diagnostics",
+		(message, _options, theme) => {
+			const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+			const heading = theme.fg("error", "🔴 pi-lens blocking diagnostics");
+			const body = typeof message.content === "string" ? message.content : "";
+			box.addChild(new Text(`${heading}\n${body}`, 0, 0));
+			return box;
+		},
+	);
+
 	const tsClient = new TypeScriptClient();
 	const astGrepClient = new AstGrepClient();
 	const ruffClient = new RuffClient();
@@ -206,6 +238,24 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerFlag("no-rust", {
 		description: "Disable Rust linting (cargo check)",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("no-powershell", {
+		description: "Disable PowerShell static analysis",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("no-delta", {
+		description: "Show all dispatch diagnostics instead of only new findings",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("stop-on-error", {
+		description: "Stop dispatch after the first blocking diagnostic group",
 		type: "boolean",
 		default: false,
 	});
@@ -952,6 +1002,11 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (!nodeFs.existsSync(filePath)) return;
 
+		const fileKind = detectFileKind(filePath);
+		const supportsAstGrep = ["jsts", "python", "go", "rust", "cxx"].includes(
+			fileKind ?? "",
+		);
+
 		// Record complexity baseline for TS/JS files + capture history snapshot
 		if (
 			complexityClient.isSupportedFile(filePath) &&
@@ -983,7 +1038,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Snapshot baselines for delta mode (no pre-write hints — delta handles it)
-		if (!pi.getFlag("no-ast-grep") && astGrepClient.isAvailable()) {
+		if (
+			supportsAstGrep &&
+			!pi.getFlag("no-ast-grep") &&
+			astGrepClient.isAvailable()
+		) {
 			const baselineDiags = astGrepClient.scanFile(filePath);
 			astGrepBaselines.set(filePath, baselineDiags);
 
@@ -999,8 +1058,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (
 			!pi.getFlag("no-biome") &&
-			biomeClient.isAvailable() &&
-			biomeClient.isSupportedFile(filePath)
+			biomeClient.isSupportedFile(filePath) &&
+			biomeClient.isAvailable()
 		) {
 			biomeBaselines.set(
 				filePath,
@@ -1116,14 +1175,18 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		let lspOutput = preHint ? `\n\n${preHint}` : "";
+		let hasBlockingDiagnostics = false;
 
 		// --- Declarative dispatch: run all applicable lint tools ---
 		// Phase 2: Replaced ~400 lines of if/else with unified dispatch system
 		dbg(`dispatch: running lint tools for ${filePath}`);
-		const dispatchOutput = await dispatchLint(filePath, projectRoot, pi);
-		if (dispatchOutput) {
-			lspOutput += `\n\n${dispatchOutput}`;
+		const dispatchResult = await dispatchLintResult(filePath, projectRoot, pi);
+		if (dispatchResult?.output) {
+			lspOutput += `\n\n${dispatchResult.output}`;
 		}
+		hasBlockingDiagnostics =
+			!!dispatchResult?.hasBlockers ||
+			/(^|\n)🔴 STOP\b/.test(dispatchResult?.output ?? "");
 
 		// Agent behavior warnings (blind writes, thrashing)
 		if (behaviorWarnings.length > 0) {
@@ -1132,8 +1195,27 @@ export default function (pi: ExtensionAPI) {
 
 		if (!lspOutput) return;
 
+		if (hasBlockingDiagnostics && dispatchResult?.output?.trim()) {
+			pi.sendMessage(
+				{
+					customType: "pi-lens-blocking-diagnostics",
+					content: dispatchResult.output.trim(),
+					display: true,
+					details: { filePath, toolName: event.toolName },
+				},
+				{ deliverAs: "followUp", triggerTurn: false },
+			);
+		}
+
 		return {
-			content: [...event.content, { type: "text" as const, text: lspOutput }],
+			content: mergeToolResultText(
+				event.content as Array<
+					| { type: "text"; text: string }
+					| { type: string; [key: string]: unknown }
+				>,
+				lspOutput,
+			),
+			isError: event.isError || hasBlockingDiagnostics,
 		};
 	});
 
@@ -1169,60 +1251,62 @@ export default function (pi: ExtensionAPI) {
 		const parts: string[] = [];
 
 		// jscpd: scan modified files, filter results to modified line ranges
-		if (jscpdClient.isAvailable()) {
-			const jscpdFiles = cacheManager.getFilesForJscpd(cwd);
-			if (jscpdFiles.length > 0) {
-				dbg(`turn_end: jscpd scanning ${jscpdFiles.length} file(s)`);
-				// Use full scan then filter — jscpd doesn't support per-file scanning
-				const result = jscpdClient.scan(cwd);
-				// Filter clones to only those intersecting modified ranges
-				const jscpdFileSet = new Set(
-					jscpdFiles.map((f) => path.resolve(cwd, f)),
+		const jscpdFiles = cacheManager
+			.getFilesForJscpd(cwd)
+			.filter((file) => jscpdClient.isSupportedFile(file));
+		if (jscpdFiles.length > 0 && jscpdClient.isAvailable()) {
+			dbg(`turn_end: jscpd scanning ${jscpdFiles.length} file(s)`);
+			// Use full scan then filter — jscpd doesn't support per-file scanning
+			const result = jscpdClient.scan(cwd);
+			// Filter clones to only those intersecting modified ranges
+			const jscpdFileSet = new Set(jscpdFiles.map((f) => path.resolve(cwd, f)));
+			const filtered = result.clones.filter((clone) => {
+				const resolvedA = path.resolve(clone.fileA);
+				if (!jscpdFileSet.has(resolvedA)) return false;
+				const relA = path.relative(cwd, resolvedA).replace(/\\/g, "/");
+				const state = turnState.files[relA];
+				if (!state) return false;
+				return cacheManager.isLineInModifiedRange(
+					clone.startA,
+					state.modifiedRanges,
 				);
-				const filtered = result.clones.filter((clone) => {
-					const resolvedA = path.resolve(clone.fileA);
-					if (!jscpdFileSet.has(resolvedA)) return false;
-					const relA = path.relative(cwd, resolvedA).replace(/\\/g, "/");
-					const state = turnState.files[relA];
-					if (!state) return false;
-					return cacheManager.isLineInModifiedRange(
-						clone.startA,
-						state.modifiedRanges,
-					);
-				});
-				if (filtered.length > 0) {
-					let report = `🔴 New duplicates in modified code:\n`;
-					for (const clone of filtered.slice(0, 5)) {
-						report += `  ${path.basename(clone.fileA)}:${clone.startA} ↔ ${path.basename(clone.fileB)}:${clone.startB} (${clone.lines} lines)\n`;
-					}
-					parts.push(report);
+			});
+			if (filtered.length > 0) {
+				let report = `🔴 New duplicates in modified code:\n`;
+				for (const clone of filtered.slice(0, 5)) {
+					report += `  ${path.basename(clone.fileA)}:${clone.startA} ↔ ${path.basename(clone.fileB)}:${clone.startB} (${clone.lines} lines)\n`;
 				}
-				// Update the global cache with fresh results
-				_cachedJscpdClones = result.clones;
-				cacheManager.writeCache("jscpd", result, cwd);
+				parts.push(report);
 			}
+			// Update the global cache with fresh results
+			_cachedJscpdClones = result.clones;
+			cacheManager.writeCache("jscpd", result, cwd);
 		}
 
 		// madge: only check files where imports changed
-		if (depChecker.isAvailable()) {
-			const madgeFiles = cacheManager.getFilesForMadge(cwd);
-			if (madgeFiles.length > 0) {
-				dbg(
-					`turn_end: madge checking ${madgeFiles.length} file(s) for circular deps`,
-				);
-				for (const file of madgeFiles) {
-					const absPath = path.resolve(cwd, file);
-					const depResult = depChecker.checkFile(absPath);
-					if (depResult.hasCircular && depResult.circular.length > 0) {
-						const circularDeps = depResult.circular
-							.flatMap((d) => d.path)
-							.filter((p: string) => !absPath.endsWith(path.basename(p)));
-						const uniqueDeps = [...new Set(circularDeps)];
-						if (uniqueDeps.length > 0) {
-							parts.push(
-								`🟡 Circular dependency in ${file}: imports ${uniqueDeps.join(", ")}`,
-							);
-						}
+		const madgeFiles = cacheManager
+			.getFilesForMadge(cwd)
+			.filter((file) => depChecker.isSupportedFile(file));
+		if (
+			!pi.getFlag("no-madge") &&
+			madgeFiles.length > 0 &&
+			depChecker.isAvailable()
+		) {
+			dbg(
+				`turn_end: madge checking ${madgeFiles.length} file(s) for circular deps`,
+			);
+			for (const file of madgeFiles) {
+				const absPath = path.resolve(cwd, file);
+				const depResult = depChecker.checkFile(absPath);
+				if (depResult.hasCircular && depResult.circular.length > 0) {
+					const circularDeps = depResult.circular
+						.flatMap((d) => d.path)
+						.filter((p: string) => !absPath.endsWith(path.basename(p)));
+					const uniqueDeps = [...new Set(circularDeps)];
+					if (uniqueDeps.length > 0) {
+						parts.push(
+							`🟡 Circular dependency in ${file}: imports ${uniqueDeps.join(", ")}`,
+						);
 					}
 				}
 			}

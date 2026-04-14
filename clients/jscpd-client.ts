@@ -12,6 +12,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isFileKind } from "./file-kinds.js";
 
 // --- Types ---
 
@@ -51,6 +52,10 @@ export class JscpdClient {
 		});
 		this.available = !result.error && result.status === 0;
 		return this.available;
+	}
+
+	isSupportedFile(filePath: string): boolean {
+		return isFileKind(filePath, ["jsts", "python", "go", "rust", "cxx"]);
 	}
 
 	/**

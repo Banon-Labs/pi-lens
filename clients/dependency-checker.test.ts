@@ -23,6 +23,17 @@ describe("DependencyChecker", () => {
 		});
 	});
 
+	describe("isSupportedFile", () => {
+		it("supports JavaScript and TypeScript files", () => {
+			expect(client.isSupportedFile("src/example.ts")).toBe(true);
+			expect(client.isSupportedFile("src/example.js")).toBe(true);
+		});
+
+		it("skips non-module file kinds such as PowerShell", () => {
+			expect(client.isSupportedFile("scripts/demo.ps1")).toBe(false);
+		});
+	});
+
 	describe("checkFile", () => {
 		it("should return no circular deps for non-existent files", () => {
 			const result = client.checkFile("/nonexistent/file.ts");

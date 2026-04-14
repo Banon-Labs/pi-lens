@@ -63,6 +63,19 @@ export const TOOL_PLANS: Record<string, ToolPlan> = {
 	},
 
 	/**
+	 * PowerShell linting tools
+	 */
+	powershell: {
+		name: "PowerShell Linting",
+		groups: [
+			// PSScriptAnalyzer
+			{ mode: "fallback", runnerIds: ["psscriptanalyzer"] },
+			// Architectural rules
+			{ mode: "fallback", runnerIds: ["architect"] },
+		],
+	},
+
+	/**
 	 * Rust linting tools
 	 */
 	rust: {

@@ -11,11 +11,12 @@
  * - RunnerDefinition: A tool that can be run
  * - Diagnostic: Structured issue representation
  * - OutputSemantic: How to display (blocking, warning, silent, etc.)
- * - BaselineStore: Track pre-existing issues for delta mode
+ * - BaselineStore: Track pre-existing issues
  */
 
 import type { FileKind } from "../file-kinds.js";
 import { detectFileKind } from "../file-kinds.js";
+import { isToolAvailable } from "../tool-availability.js";
 
 import type {
 	BaselineStore,
@@ -28,6 +29,16 @@ import type {
 	RunnerGroup,
 	RunnerResult,
 } from "./types.js";
+
+const RUNNER_DISABLE_FLAGS: Partial<Record<string, string>> = {
+	"ast-grep": "no-ast-grep",
+	"biome-lint": "no-biome",
+	"go-vet": "no-go",
+	psscriptanalyzer: "no-powershell",
+	"ruff-lint": "no-ruff",
+	"rust-clippy": "no-rust",
+	"ts-lsp": "no-lsp",
+};
 
 // --- In-Memory Baseline Store ---
 
@@ -59,6 +70,10 @@ export function registerRunner(runner: RunnerDefinition): void {
 	globalRegistry.set(runner.id, runner);
 }
 
+export function clearRunnerRegistryForTests(): void {
+	globalRegistry.clear();
+}
+
 export function getRunner(id: string): RunnerDefinition | undefined {
 	return globalRegistry.get(id);
 }
@@ -80,30 +95,6 @@ export function listRunners(): RunnerDefinition[] {
 	return Array.from(globalRegistry.values());
 }
 
-// --- Tool Availability Cache ---
-
-const toolCache = new Map<string, boolean>();
-
-function checkToolAvailability(command: string): boolean {
-	if (toolCache.has(command)) {
-		return toolCache.get(command)!;
-	}
-	try {
-		const { spawnSync } = require("node:child_process");
-		const result = spawnSync(command, ["--version"], {
-			encoding: "utf-8",
-			timeout: 5000,
-			shell: true,
-		});
-		const available = result.status === 0;
-		toolCache.set(command, available);
-		return available;
-	} catch {
-		toolCache.set(command, false);
-		return false;
-	}
-}
-
 // --- Dispatch Context Factory ---
 
 export function createDispatchContext(
@@ -120,11 +111,11 @@ export function createDispatchContext(
 		kind,
 		pi,
 		autofix: !!(pi.getFlag("autofix-biome") || pi.getFlag("autofix-ruff")),
-		deltaMode: !pi.getFlag("no-delta"),
+		deltaMode: !isFlagEnabled(pi, "no-delta"),
 		baselines: baselines ?? createBaselineStore(),
 
 		async hasTool(command: string): Promise<boolean> {
-			return checkToolAvailability(command);
+			return isToolAvailable(command);
 		},
 
 		log(message: string): void {
@@ -135,9 +126,6 @@ export function createDispatchContext(
 
 // --- Delta Mode Logic ---
 
-/**
- * Filter diagnostics to only show NEW issues (delta mode)
- */
 function filterDelta<T extends { id: string }>(
 	after: T[],
 	before: T[] | undefined,
@@ -164,7 +152,7 @@ const EMOJI: Record<string, string> = {
 };
 
 function formatDiagnostic(d: Diagnostic): string {
-	const line = d.line ? `L${d.line}: ` : "";
+	const line = d.line ? `L${d.line}${d.column ? `:${d.column}` : ""}: ` : "";
 	return `  ${line}${d.message}`;
 }
 
@@ -203,76 +191,93 @@ export async function dispatchForFile(
 	ctx: DispatchContext,
 	groups: RunnerGroup[],
 ): Promise<DispatchResult> {
-	const allDiagnostics: Diagnostic[] = [];
-	const _fixed: Diagnostic[] = [];
-	let stopped = false;
+	const observedDiagnostics: Diagnostic[] = [];
+	let stopRequested = false;
 
 	for (const group of groups) {
-		if (stopped && ctx.pi.getFlag("stop-on-error")) {
+		if (stopRequested) {
 			break;
 		}
 
-		// Filter runners by kind if specified
-		const runnerIds = group.filterKinds
-			? group.runnerIds.filter((id) => {
-					const runner = getRunner(id);
-					return runner && ctx.kind && group.filterKinds?.includes(ctx.kind);
-				})
-			: group.runnerIds;
+		const runnerIds = getEligibleRunnerIds(ctx, group);
+		if (runnerIds.length === 0) {
+			continue;
+		}
 
-		const semantic = group.semantic ?? "warning";
+		if (group.mode === "all") {
+			for (const runnerId of runnerIds) {
+				const result = await maybeRunRunner(ctx, runnerId, group.semantic);
+				if (!result) continue;
+
+				observedDiagnostics.push(...result.diagnostics);
+				if (
+					isFlagEnabled(ctx.pi, "stop-on-error") &&
+					hasBlockingDiagnostics(result.diagnostics)
+				) {
+					stopRequested = true;
+					break;
+				}
+			}
+			continue;
+		}
+
+		if (group.mode === "fallback") {
+			for (const runnerId of runnerIds) {
+				const result = await maybeRunRunner(ctx, runnerId, group.semantic);
+				if (!result) continue;
+
+				observedDiagnostics.push(...result.diagnostics);
+				if (
+					isFlagEnabled(ctx.pi, "stop-on-error") &&
+					hasBlockingDiagnostics(result.diagnostics)
+				) {
+					stopRequested = true;
+				}
+				if (result.status !== "skipped") {
+					break;
+				}
+			}
+			continue;
+		}
 
 		for (const runnerId of runnerIds) {
-			const runner = getRunner(runnerId);
-			if (!runner) continue;
+			const result = await maybeRunRunner(ctx, runnerId, group.semantic);
+			if (!result) continue;
 
-			// Check preconditions
-			if (runner.when && !(await runner.when(ctx))) {
-				continue;
+			observedDiagnostics.push(...result.diagnostics);
+			if (
+				isFlagEnabled(ctx.pi, "stop-on-error") &&
+				hasBlockingDiagnostics(result.diagnostics)
+			) {
+				stopRequested = true;
+				break;
 			}
-
-			const result = await runRunner(ctx, runner, semantic);
-
-			// Apply delta mode filtering
-			let diagnostics = result.diagnostics;
-			if (ctx.deltaMode && result.semantic !== "silent") {
-				const before = ctx.baselines.get(ctx.filePath);
-				if (before) {
-					const filtered = filterDelta(
-						diagnostics,
-						before as Diagnostic[],
-						(d) => d.id,
-					);
-					diagnostics = filtered.new;
-					// TODO: Track fixed diagnostics
-				}
-				// Update baseline
-				ctx.baselines.set(ctx.filePath, [...allDiagnostics, ...diagnostics]);
-			}
-
-			allDiagnostics.push(...diagnostics);
-
-			// Check for blockers
-			if (semantic === "blocking" && diagnostics.length > 0) {
-				stopped = true;
+			if (result.status === "succeeded") {
+				break;
 			}
 		}
 	}
 
-	// Categorize results
-	const blockers = allDiagnostics.filter((d) => d.semantic === "blocking");
-	const warnings = allDiagnostics.filter(
+	const baselineBefore = ctx.baselines.get(ctx.filePath) as Diagnostic[] | undefined;
+	ctx.baselines.set(ctx.filePath, observedDiagnostics);
+
+	const delta = ctx.deltaMode
+		? filterDelta(observedDiagnostics, baselineBefore, (d) => d.id)
+		: { new: observedDiagnostics, fixed: [] as Diagnostic[] };
+	const visibleDiagnostics = delta.new;
+
+	const blockers = visibleDiagnostics.filter((d) => d.semantic === "blocking");
+	const warnings = visibleDiagnostics.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
 	);
-	const fixedItems = allDiagnostics.filter((d) => d.semantic === "fixed");
+	const fixedItems = visibleDiagnostics.filter((d) => d.semantic === "fixed");
 
-	// Format output
 	let output = formatDiagnostics(blockers, "blocking");
 	output += formatDiagnostics(warnings, "warning");
 	output += formatDiagnostics(fixedItems, "fixed");
 
 	return {
-		diagnostics: allDiagnostics,
+		diagnostics: visibleDiagnostics,
 		blockers,
 		warnings,
 		fixed: fixedItems,
@@ -282,6 +287,39 @@ export async function dispatchForFile(
 }
 
 // --- Run Single Runner ---
+
+async function maybeRunRunner(
+	ctx: DispatchContext,
+	runnerId: string,
+	defaultSemantic?: OutputSemantic,
+): Promise<RunnerResult | undefined> {
+	const runner = getRunner(runnerId);
+	if (!runner) return undefined;
+	if (!(await shouldRunRunner(ctx, runner))) {
+		return undefined;
+	}
+	return runRunner(ctx, runner, defaultSemantic ?? "warning");
+}
+
+async function shouldRunRunner(
+	ctx: DispatchContext,
+	runner: RunnerDefinition,
+): Promise<boolean> {
+	const disableFlag = RUNNER_DISABLE_FLAGS[runner.id];
+	if (disableFlag && isFlagEnabled(ctx.pi, disableFlag)) {
+		return false;
+	}
+
+	if (!runner.enabledByDefault && !runner.when) {
+		return false;
+	}
+
+	if (runner.when) {
+		return !!(await runner.when(ctx));
+	}
+
+	return true;
+}
 
 async function runRunner(
 	ctx: DispatchContext,
@@ -304,6 +342,27 @@ async function runRunner(
 	}
 }
 
+function getEligibleRunnerIds(
+	ctx: DispatchContext,
+	group: RunnerGroup,
+): string[] {
+	if (!group.filterKinds || !ctx.kind) {
+		return group.runnerIds;
+	}
+	return group.runnerIds.filter((runnerId) => {
+		const runner = getRunner(runnerId);
+		return !!runner && group.filterKinds?.includes(ctx.kind!);
+	});
+}
+
+function hasBlockingDiagnostics(diagnostics: Diagnostic[]): boolean {
+	return diagnostics.some((diagnostic) => diagnostic.semantic === "blocking");
+}
+
+function isFlagEnabled(pi: PiAgentAPI, flag: string): boolean {
+	return pi.getFlag(flag) === true;
+}
+
 // --- Simple Integration Helper ---
 
 export async function dispatchLint(
@@ -313,18 +372,15 @@ export async function dispatchLint(
 	baselines?: BaselineStore,
 ): Promise<string> {
 	const ctx = createDispatchContext(filePath, cwd, pi, baselines);
-
-	// Get runners for this file kind
 	const runners = getRunnersForKind(ctx.kind);
 	if (runners.length === 0) {
 		return "";
 	}
 
-	// Create groups from registered runners (all in fallback mode)
 	const groups: RunnerGroup[] = [
 		{
 			mode: "fallback",
-			runnerIds: runners.map((r) => r.id),
+			runnerIds: runners.map((runner) => runner.id),
 		},
 	];
 

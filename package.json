@@ -49,6 +49,7 @@
 		"typescript": "^5.0.0"
 	},
 	"devDependencies": {
+		"@mariozechner/pi-ai": "^0.66.1",
 		"@types/node": "^22.10.5",
 		"vitest": "^4.1.1"
 	},

@@ -46,3 +46,7 @@ jscpd-report.json
 
 # Linter caches
 .ruff_cache/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
