@@ -216,6 +216,28 @@ PowerShell dispatch notes:
 - parse errors are surfaced even when project settings suppress them
 - `PSScriptAnalyzerSettings.psd1` itself is excluded from ordinary write-time linting
 
+### Validate PowerShell support locally
+
+Use the proof tests below as the primary local gate for this branch.
+
+1. Runner + lifecycle proof tests
+
+```bash
+npm test -- clients/dispatch/runners/powershell.test.ts index.blocking-diagnostics.test.ts
+```
+
+Expected result: Vitest passes, including the PowerShell runner coverage and the blocking-diagnostics lifecycle proof.
+
+2. Optional Kitty smoke helper
+
+```bash
+scripts/pi-lens-powershell-demo-smoke.sh --out-dir /tmp/pi-lens-pwsh-smoke --turn-timeout 240 --quit-after
+```
+
+This helper now explicitly loads `./index.ts` alongside the authless smoke-sandbox provider so the local pi-lens extension is in the session under test.
+
+Note: the proof tests above are the authoritative local check. The Kitty smoke helper still depends on the shared `pi-smoke-sandbox` PowerShell demo fixture matching the intended blocking sample.
+
 ---
 
 ## Flags

@@ -111,6 +111,8 @@ cmd=(
 	--title "$title"
 	--tools "read,grep,find,ls,write,edit,bash"
 	--turn-timeout "$turn_timeout"
+	--pi-arg --extension
+	--pi-arg "$repo_root/index.ts"
 	--phrase "$phrase"
 )
 
